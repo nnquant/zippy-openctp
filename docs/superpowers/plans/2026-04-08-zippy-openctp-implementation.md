@@ -51,7 +51,7 @@ fn tick_data_schema_contains_required_columns_in_stable_order() {
 
 - [ ] **Step 2: 跑 schema test，确认红灯**
 
-Run: `cargo test -p zippy-openctp-core schema_contract -v`
+Run: `cargo test -p zippy-openctp-core --test schema_contract -v`
 Expected: FAIL，原因是 `tick_data_schema()` 尚不存在或不返回稳定 Arrow schema
 
 - [ ] **Step 3: 实现最小 schema 代码**
@@ -93,7 +93,7 @@ def TickDataSchema():
 
 - [ ] **Step 5: 重跑 schema test，确认绿灯**
 
-Run: `cargo test -p zippy-openctp-core schema_contract -v`
+Run: `cargo test -p zippy-openctp-core --test schema_contract -v`
 Expected: PASS
 
 - [ ] **Step 6: 提交 schema 任务**
