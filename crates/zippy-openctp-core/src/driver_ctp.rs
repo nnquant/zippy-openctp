@@ -13,7 +13,10 @@ use ctp2rs::v1alpha1::{
 use zippy_core::{Result as CoreResult, ZippyError};
 
 use crate::normalize::RawTickSnapshot;
-use crate::source::{MdDriver, MdDriverEvent, MdDriverHandle, OpenCtpMarketDataSourceConfig};
+use crate::source::{
+    evaluate_subscription_results, MdDriver, MdDriverEvent, MdDriverHandle,
+    OpenCtpMarketDataSourceConfig, SubscriptionOutcome,
+};
 
 const DRIVER_UNIMPLEMENTED_REASON: &str = "ctp2rs live driver wiring is not implemented yet";
 const LOGIN_REQUEST_ID: i32 = 1;
@@ -126,6 +129,11 @@ impl MdDriver for Ctp2rsMdDriver {
 enum LiveMdControlEvent {
     FrontConnected,
     UserLoginSucceeded,
+    SubscriptionResponse {
+        instrument_id: Option<String>,
+        succeeded: bool,
+        is_last: bool,
+    },
     DriverError(String),
 }
 
@@ -220,6 +228,24 @@ impl MdSpi for LiveMdSpi {
 
         let _ = self.data_tx.send(MdDriverEvent::Tick(raw));
     }
+
+    fn on_rsp_sub_market_data(
+        &mut self,
+        specific_instrument: Option<&ctp2rs::v1alpha1::CThostFtdcSpecificInstrumentField>,
+        rsp_info: Option<&CThostFtdcRspInfoField>,
+        _request_id: i32,
+        is_last: bool,
+    ) {
+        let instrument_id = specific_instrument
+            .and_then(|instrument| decode_ctp_text(&instrument.InstrumentID).ok());
+        let succeeded = rsp_info_error_reason(rsp_info).is_none();
+
+        let _ = self.control_tx.send(LiveMdControlEvent::SubscriptionResponse {
+            instrument_id,
+            succeeded,
+            is_last,
+        });
+    }
 }
 
 fn resolve_live_md_dynlib_path() -> CoreResult<PathBuf> {
@@ -244,6 +270,8 @@ fn run_live_driver_loop(
     control_rx: &crossbeam_channel::Receiver<LiveMdControlEvent>,
     tx: &Sender<MdDriverEvent>,
 ) -> CoreResult<()> {
+    let mut pending_subscription = PendingSubscription::new(config.instruments.as_slice());
+
     loop {
         select! {
             recv(stop_rx) -> _ => {
@@ -292,6 +320,14 @@ fn run_live_driver_loop(
                             return Err(ZippyError::Io { reason });
                         }
                     }
+                    Ok(LiveMdControlEvent::SubscriptionResponse { instrument_id, succeeded, is_last }) => {
+                        pending_subscription.observe(instrument_id, succeeded);
+                        if is_last {
+                            let outcome = pending_subscription.finish();
+                            tx.send(MdDriverEvent::SubscriptionOutcome(outcome))
+                                .map_err(|_| ZippyError::ChannelSend)?;
+                        }
+                    }
                     Ok(LiveMdControlEvent::DriverError(reason)) => {
                         if stopping.load(Ordering::SeqCst) {
                             return Ok(());
@@ -307,6 +343,40 @@ fn run_live_driver_loop(
                 }
             }
         }
+    }
+}
+
+struct PendingSubscription {
+    requested: Vec<String>,
+    succeeded: Vec<String>,
+}
+
+impl PendingSubscription {
+    fn new(requested: &[String]) -> Self {
+        Self {
+            requested: requested.to_vec(),
+            succeeded: Vec::new(),
+        }
+    }
+
+    fn observe(&mut self, instrument_id: Option<String>, succeeded: bool) {
+        if !succeeded {
+            return;
+        }
+
+        let Some(instrument_id) = instrument_id else {
+            return;
+        };
+
+        if self.succeeded.iter().any(|item| item == &instrument_id) {
+            return;
+        }
+
+        self.succeeded.push(instrument_id);
+    }
+
+    fn finish(&self) -> SubscriptionOutcome {
+        evaluate_subscription_results(self.requested.as_slice(), self.succeeded.as_slice())
     }
 }
 

@@ -253,9 +253,48 @@ impl FakeOpenCtpSourceRuntime {
 
 pub enum MdDriverEvent {
     Tick(RawTickSnapshot),
+    SubscriptionOutcome(SubscriptionOutcome),
     Flush,
     Stop,
     Error(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubscriptionOutcome {
+    pub succeeded_instruments: Vec<String>,
+    pub failed_instruments: Vec<String>,
+    pub subscribe_failures_total: u64,
+    pub status: OpenCtpSourceStatus,
+}
+
+pub fn evaluate_subscription_results(
+    requested: &[String],
+    succeeded: &[String],
+) -> SubscriptionOutcome {
+    let mut succeeded_instruments = Vec::new();
+    let mut failed_instruments = Vec::new();
+
+    for instrument in requested {
+        if succeeded.iter().any(|item| item == instrument) {
+            succeeded_instruments.push(instrument.clone());
+        } else {
+            failed_instruments.push(instrument.clone());
+        }
+    }
+
+    let subscribe_failures_total = failed_instruments.len() as u64;
+    let status = if subscribe_failures_total == 0 {
+        OpenCtpSourceStatus::Running
+    } else {
+        OpenCtpSourceStatus::Degraded
+    };
+
+    SubscriptionOutcome {
+        succeeded_instruments,
+        failed_instruments,
+        subscribe_failures_total,
+        status,
+    }
 }
 
 type MdDriverStopFn = Box<dyn FnMut() -> CoreResult<()> + Send>;
@@ -516,6 +555,11 @@ fn run_driver_event_loop(
                     record_batch_emission(metrics, &batch);
                     sink.emit(SourceEvent::Data(batch))?;
                 }
+            }
+            MdDriverEvent::SubscriptionOutcome(outcome) => {
+                metrics.lock().unwrap().subscribe_failures_total +=
+                    outcome.subscribe_failures_total;
+                set_status(status, outcome.status);
             }
             MdDriverEvent::Flush => {
                 if let Some(batch) = emitter.flush().map_err(map_source_error)? {
