@@ -1,3 +1,15 @@
+from typing import Literal, TypedDict
+
+
+class OpenCtpSourceMetricsDict(TypedDict):
+    ticks_received_total: int
+    ticks_emitted_total: int
+    batches_emitted_total: int
+    reconnects_total: int
+    login_failures_total: int
+    subscribe_failures_total: int
+
+
 class OpenCtpMarketDataSource:
     def __init__(
         self,
@@ -12,9 +24,11 @@ class OpenCtpMarketDataSource:
         reconnect: bool = True,
         login_timeout_sec: int = 10,
     ) -> None: ...
-    def status(self) -> str: ...
+    def status(
+        self,
+    ) -> Literal["created", "connecting", "running", "degraded", "stopped", "failed"]: ...
     def config(self) -> dict[str, object]: ...
-    def metrics(self) -> dict[str, int]: ...
+    def metrics(self) -> OpenCtpSourceMetricsDict: ...
 
 
 def tick_data_schema_fields() -> list[tuple[str, str, bool]]: ...

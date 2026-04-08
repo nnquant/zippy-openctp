@@ -3,7 +3,7 @@
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple};
 use zippy_openctp_core::schema::{TickSchemaType, TICK_SCHEMA_FIELDS};
-use zippy_openctp_core::{OpenCtpMarketDataSourceConfig, OpenCtpSourceMetrics};
+use zippy_openctp_core::{OpenCtpMarketDataSource as CoreOpenCtpMarketDataSource, OpenCtpMarketDataSourceConfig};
 
 #[pyfunction]
 fn tick_data_schema_fields(py: Python<'_>) -> PyResult<PyObject> {
@@ -26,7 +26,7 @@ fn tick_data_schema_fields(py: Python<'_>) -> PyResult<PyObject> {
 #[pyclass]
 struct OpenCtpMarketDataSource {
     config: OpenCtpMarketDataSourceConfig,
-    metrics: OpenCtpSourceMetrics,
+    source: CoreOpenCtpMarketDataSource,
 }
 
 #[pymethods]
@@ -71,13 +71,13 @@ impl OpenCtpMarketDataSource {
         config.login_timeout_sec = login_timeout_sec;
 
         Self {
+            source: CoreOpenCtpMarketDataSource::new(config.clone()),
             config,
-            metrics: OpenCtpSourceMetrics::default(),
         }
     }
 
-    fn status(&self) -> &'static str {
-        "created"
+    fn status(&self) -> &str {
+        self.source.status().as_str()
     }
 
     fn config(&self, py: Python<'_>) -> PyResult<PyObject> {
@@ -96,13 +96,14 @@ impl OpenCtpMarketDataSource {
     }
 
     fn metrics(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let metrics = self.source.metrics();
         let dict = PyDict::new_bound(py);
-        dict.set_item("ticks_received_total", self.metrics.ticks_received_total)?;
-        dict.set_item("ticks_emitted_total", self.metrics.ticks_emitted_total)?;
-        dict.set_item("batches_emitted_total", self.metrics.batches_emitted_total)?;
-        dict.set_item("reconnects_total", self.metrics.reconnects_total)?;
-        dict.set_item("login_failures_total", self.metrics.login_failures_total)?;
-        dict.set_item("subscribe_failures_total", self.metrics.subscribe_failures_total)?;
+        dict.set_item("ticks_received_total", metrics.ticks_received_total)?;
+        dict.set_item("ticks_emitted_total", metrics.ticks_emitted_total)?;
+        dict.set_item("batches_emitted_total", metrics.batches_emitted_total)?;
+        dict.set_item("reconnects_total", metrics.reconnects_total)?;
+        dict.set_item("login_failures_total", metrics.login_failures_total)?;
+        dict.set_item("subscribe_failures_total", metrics.subscribe_failures_total)?;
         Ok(dict.into_py(py))
     }
 }

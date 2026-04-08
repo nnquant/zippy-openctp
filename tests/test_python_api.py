@@ -31,5 +31,17 @@ def test_openctp_source_exposes_config_status_and_metrics():
     assert config["flush_interval_ms"] == 0
     assert config["password"] == "***redacted***"
     assert source.status() == "created"
+    assert set(metrics) == {
+        "ticks_received_total",
+        "ticks_emitted_total",
+        "batches_emitted_total",
+        "reconnects_total",
+        "login_failures_total",
+        "subscribe_failures_total",
+    }
     assert metrics["ticks_received_total"] == 0
     assert metrics["ticks_emitted_total"] == 0
+    assert metrics["batches_emitted_total"] == 0
+    assert metrics["reconnects_total"] == 0
+    assert metrics["login_failures_total"] == 0
+    assert metrics["subscribe_failures_total"] == 0
