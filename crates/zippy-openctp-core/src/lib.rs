@@ -8,5 +8,5 @@ pub use normalize::{normalize_tick, NormalizeError, NormalizedTickRow, RawTickSn
 pub use schema::{tick_data_schema, tick_data_schema_name, TickSchemaField, TickSchemaType, TICK_SCHEMA_FIELDS};
 pub use source::{
     FakeMdDriver, FakeMdDriverHandle, MdDriver, MdDriverEvent, MdDriverHandle, OpenCtpMarketDataSource,
-    OpenCtpMarketDataSourceConfig,
+    OpenCtpMarketDataSourceConfig, OpenCtpSourceStatus,
 };

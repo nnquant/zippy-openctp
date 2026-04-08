@@ -86,6 +86,29 @@ impl OpenCtpMarketDataSourceConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenCtpSourceStatus {
+    Created,
+    Connecting,
+    Running,
+    Degraded,
+    Stopped,
+    Failed,
+}
+
+impl OpenCtpSourceStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Created => "created",
+            Self::Connecting => "connecting",
+            Self::Running => "running",
+            Self::Degraded => "degraded",
+            Self::Stopped => "stopped",
+            Self::Failed => "failed",
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum SourceError {
     Normalize(NormalizeError),
