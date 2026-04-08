@@ -10,4 +10,5 @@ crate-type = ["cdylib"]
 path = "src/lib.rs"
 
 [dependencies]
+pyo3 = { version = "0.22", features = ["extension-module"] }
 zippy-openctp-core = { path = "../zippy-openctp-core" }
