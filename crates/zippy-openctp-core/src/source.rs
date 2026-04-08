@@ -14,6 +14,7 @@ use zippy_core::{
     StreamHello, ZippyError,
 };
 
+use crate::driver_ctp::Ctp2rsMdDriver;
 use crate::metrics::OpenCtpSourceMetrics;
 use crate::normalize::{normalize_tick, NormalizedTickRow, NormalizeError, RawTickSnapshot};
 use crate::schema::tick_data_schema;
@@ -341,6 +342,10 @@ pub struct OpenCtpMarketDataSource {
 }
 
 impl OpenCtpMarketDataSource {
+    pub fn new(config: OpenCtpMarketDataSourceConfig) -> Self {
+        Self::from_driver(config.clone(), Box::new(Ctp2rsMdDriver::new(config)))
+    }
+
     pub fn from_driver(config: OpenCtpMarketDataSourceConfig, driver: Box<dyn MdDriver>) -> Self {
         Self {
             config,
