@@ -2,7 +2,7 @@ use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::thread::{self, JoinHandle};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use arrow::array::{
     ArrayRef, Float64Array, Int64Array, StringArray, TimestampNanosecondArray,
@@ -254,9 +254,16 @@ impl FakeOpenCtpSourceRuntime {
 pub enum MdDriverEvent {
     Tick(RawTickSnapshot),
     SubscriptionOutcome(SubscriptionOutcome),
+    ReconnectUpdate(ReconnectUpdate),
     Flush,
     Stop,
     Error(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReconnectUpdate {
+    pub reconnects_total: u64,
+    pub status: OpenCtpSourceStatus,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -294,6 +301,72 @@ pub fn evaluate_subscription_results(
         failed_instruments,
         subscribe_failures_total,
         status,
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ReconnectState {
+    reconnect_interval: Duration,
+    reconnects_total: u64,
+    status: OpenCtpSourceStatus,
+    disconnected_at: Option<Instant>,
+}
+
+impl ReconnectState {
+    pub fn new(reconnect_interval: Duration) -> Self {
+        Self {
+            reconnect_interval,
+            reconnects_total: 0,
+            status: OpenCtpSourceStatus::Running,
+            disconnected_at: None,
+        }
+    }
+
+    pub fn status(&self) -> OpenCtpSourceStatus {
+        self.status
+    }
+
+    pub fn reconnect_interval(&self) -> Duration {
+        self.reconnect_interval
+    }
+
+    pub fn reconnects_total(&self) -> u64 {
+        self.reconnects_total
+    }
+
+    pub fn mark_disconnected_at(&mut self, now: Instant) {
+        self.status = OpenCtpSourceStatus::Degraded;
+        self.disconnected_at = Some(now);
+    }
+
+    pub fn ready_to_reconnect_at(&self, now: Instant) -> bool {
+        match self.disconnected_at {
+            Some(disconnected_at) => now.duration_since(disconnected_at) >= self.reconnect_interval,
+            None => true,
+        }
+    }
+
+    pub fn remaining_until_reconnect_at(&self, now: Instant) -> Duration {
+        match self.disconnected_at {
+            Some(disconnected_at) => {
+                let elapsed = now.saturating_duration_since(disconnected_at);
+                self.reconnect_interval.saturating_sub(elapsed)
+            }
+            None => Duration::ZERO,
+        }
+    }
+
+    pub fn mark_reconnected(&mut self) {
+        self.reconnects_total += 1;
+        self.status = OpenCtpSourceStatus::Running;
+        self.disconnected_at = None;
+    }
+
+    pub fn snapshot(&self) -> ReconnectUpdate {
+        ReconnectUpdate {
+            reconnects_total: self.reconnects_total,
+            status: self.status,
+        }
     }
 }
 
@@ -398,6 +471,10 @@ impl OpenCtpMarketDataSource {
 
     pub fn metrics(&self) -> OpenCtpSourceMetrics {
         self.metrics.lock().unwrap().clone()
+    }
+
+    pub fn metrics_handle(&self) -> Arc<Mutex<OpenCtpSourceMetrics>> {
+        self.metrics.clone()
     }
 
     pub fn status(&self) -> OpenCtpSourceStatus {
@@ -560,6 +637,10 @@ fn run_driver_event_loop(
                 metrics.lock().unwrap().subscribe_failures_total +=
                     outcome.subscribe_failures_total;
                 set_status(status, outcome.status);
+            }
+            MdDriverEvent::ReconnectUpdate(update) => {
+                metrics.lock().unwrap().reconnects_total = update.reconnects_total;
+                set_status(status, update.status);
             }
             MdDriverEvent::Flush => {
                 if let Some(batch) = emitter.flush().map_err(map_source_error)? {

@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
+use std::time::Instant;
 
 use crossbeam_channel::{select, unbounded, Sender};
 use ctp2rs::ffi::{gb18030_cstr_i8_to_str, resolve_dynlib_path, DynLibKind, SetString};
@@ -15,11 +16,12 @@ use zippy_core::{Result as CoreResult, ZippyError};
 use crate::normalize::RawTickSnapshot;
 use crate::source::{
     evaluate_subscription_results, MdDriver, MdDriverEvent, MdDriverHandle,
-    OpenCtpMarketDataSourceConfig, SubscriptionOutcome,
+    OpenCtpMarketDataSourceConfig, ReconnectState, SubscriptionOutcome,
 };
 
 const DRIVER_UNIMPLEMENTED_REASON: &str = "ctp2rs live driver wiring is not implemented yet";
 const LOGIN_REQUEST_ID: i32 = 1;
+const RECONNECT_INTERVAL_SECS: u64 = 3;
 
 pub struct Ctp2rsMdDriver {
     config: OpenCtpMarketDataSourceConfig,
@@ -128,6 +130,7 @@ impl MdDriver for Ctp2rsMdDriver {
 #[derive(Debug)]
 enum LiveMdControlEvent {
     FrontConnected,
+    FrontDisconnected(i32),
     UserLoginSucceeded,
     SubscriptionResponse {
         instrument_id: Option<String>,
@@ -167,9 +170,9 @@ impl MdSpi for LiveMdSpi {
             return;
         }
 
-        let _ = self.control_tx.send(LiveMdControlEvent::DriverError(format!(
-            "ctp md front disconnected reason=[{reason}]"
-        )));
+        let _ = self
+            .control_tx
+            .send(LiveMdControlEvent::FrontDisconnected(reason));
     }
 
     fn on_rsp_user_login(
@@ -271,6 +274,8 @@ fn run_live_driver_loop(
     tx: &Sender<MdDriverEvent>,
 ) -> CoreResult<()> {
     let mut pending_subscription = PendingSubscription::new(config.instruments.as_slice());
+    let mut reconnect_state =
+        ReconnectState::new(std::time::Duration::from_secs(RECONNECT_INTERVAL_SECS));
 
     loop {
         select! {
@@ -284,6 +289,16 @@ fn run_live_driver_loop(
             recv(control_rx) -> event => {
                 match event {
                     Ok(LiveMdControlEvent::FrontConnected) => {
+                        if reconnect_state.status() == crate::source::OpenCtpSourceStatus::Degraded {
+                            let remaining = reconnect_state.remaining_until_reconnect_at(Instant::now());
+                            if !remaining.is_zero() {
+                                thread::sleep(remaining);
+                            }
+                            reconnect_state.mark_reconnected();
+                            tx.send(MdDriverEvent::ReconnectUpdate(reconnect_state.snapshot()))
+                                .map_err(|_| ZippyError::ChannelSend)?;
+                        }
+
                         let mut login = CThostFtdcReqUserLoginField::default();
                         login.BrokerID.set_str(&config.broker_id);
                         login.UserID.set_str(&config.user_id);
@@ -319,6 +334,11 @@ fn run_live_driver_loop(
                                 .map_err(|_| ZippyError::ChannelSend)?;
                             return Err(ZippyError::Io { reason });
                         }
+                    }
+                    Ok(LiveMdControlEvent::FrontDisconnected(_reason)) => {
+                        reconnect_state.mark_disconnected_at(Instant::now());
+                        tx.send(MdDriverEvent::ReconnectUpdate(reconnect_state.snapshot()))
+                            .map_err(|_| ZippyError::ChannelSend)?;
                     }
                     Ok(LiveMdControlEvent::SubscriptionResponse { instrument_id, succeeded, is_last }) => {
                         pending_subscription.observe(instrument_id, succeeded);
