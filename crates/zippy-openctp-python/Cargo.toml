@@ -1,0 +1,13 @@
+[package]
+name = "zippy-openctp-python"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "zippy_openctp_internal"
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+zippy-openctp-core = { path = "../zippy-openctp-core" }
