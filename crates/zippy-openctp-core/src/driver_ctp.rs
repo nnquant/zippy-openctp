@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::env;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -5,7 +6,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 
-use crossbeam_channel::{select, unbounded, Sender};
+use crossbeam_channel::{after, select, unbounded, Sender};
 use ctp2rs::ffi::{gb18030_cstr_i8_to_str, resolve_dynlib_path, DynLibKind, SetString};
 use ctp2rs::v1alpha1::{
     CThostFtdcDepthMarketDataField, CThostFtdcReqUserLoginField, CThostFtdcRspInfoField, MdApi,
@@ -59,7 +60,11 @@ impl MdDriver for Ctp2rsMdDriver {
                 })?;
 
             let (control_tx, control_rx) = unbounded();
-            let spi = Box::new(LiveMdSpi::new(control_tx, tx.clone(), join_stopping.clone()));
+            let spi = Box::new(LiveMdSpi::new(
+                control_tx,
+                tx.clone(),
+                join_stopping.clone(),
+            ));
 
             api.register_spi(Box::into_raw(spi));
             api.register_front(&config.front);
@@ -108,16 +113,11 @@ impl MdDriver for Ctp2rsMdDriver {
 
         let stop_fn = {
             let stop_tx = stop_tx.clone();
-            let stop_api_holder = api_holder.clone();
             let stop_stopping = stopping.clone();
 
             Box::new(move || -> CoreResult<()> {
                 stop_stopping.store(true, Ordering::SeqCst);
                 stop_tx.send(()).map_err(|_| ZippyError::ChannelSend)?;
-
-                if let Some(api) = stop_api_holder.lock().unwrap().as_ref() {
-                    api.release();
-                }
 
                 Ok(())
             })
@@ -133,6 +133,7 @@ enum LiveMdControlEvent {
     FrontDisconnected(i32),
     UserLoginSucceeded,
     SubscriptionResponse {
+        request_id: i32,
         instrument_id: Option<String>,
         succeeded: bool,
         is_last: bool,
@@ -191,9 +192,7 @@ impl MdSpi for LiveMdSpi {
             return;
         }
 
-        let _ = self
-            .control_tx
-            .send(LiveMdControlEvent::UserLoginSucceeded);
+        let _ = self.control_tx.send(LiveMdControlEvent::UserLoginSucceeded);
     }
 
     fn on_rsp_error(
@@ -208,7 +207,9 @@ impl MdSpi for LiveMdSpi {
 
         let reason = rsp_info_error_reason(rsp_info)
             .unwrap_or_else(|| "ctp md rsp error without detailed info".to_string());
-        let _ = self.control_tx.send(LiveMdControlEvent::DriverError(reason));
+        let _ = self
+            .control_tx
+            .send(LiveMdControlEvent::DriverError(reason));
     }
 
     fn on_rtn_depth_market_data(
@@ -236,18 +237,32 @@ impl MdSpi for LiveMdSpi {
         &mut self,
         specific_instrument: Option<&ctp2rs::v1alpha1::CThostFtdcSpecificInstrumentField>,
         rsp_info: Option<&CThostFtdcRspInfoField>,
-        _request_id: i32,
+        request_id: i32,
         is_last: bool,
     ) {
         let instrument_id = specific_instrument
             .and_then(|instrument| decode_ctp_text(&instrument.InstrumentID).ok());
         let succeeded = rsp_info_error_reason(rsp_info).is_none();
 
-        let _ = self.control_tx.send(LiveMdControlEvent::SubscriptionResponse {
-            instrument_id,
-            succeeded,
-            is_last,
-        });
+        let _ = self
+            .control_tx
+            .send(LiveMdControlEvent::SubscriptionResponse {
+                request_id,
+                instrument_id,
+                succeeded,
+                is_last,
+            });
+    }
+}
+
+fn release_api(api_holder: &Arc<std::sync::Mutex<Option<MdApi>>>) {
+    let api = {
+        let mut guard = api_holder.lock().unwrap();
+        guard.take()
+    };
+
+    if let Some(api) = api {
+        api.release();
     }
 }
 
@@ -281,22 +296,31 @@ fn run_live_driver_loop(
         select! {
             recv(stop_rx) -> _ => {
                 stopping.store(true, Ordering::SeqCst);
-                if let Some(api) = api_holder.lock().unwrap().as_ref() {
-                    api.release();
-                }
+                release_api(api_holder);
                 return Ok(());
             }
             recv(control_rx) -> event => {
                 match event {
                     Ok(LiveMdControlEvent::FrontConnected) => {
-                        if reconnect_state.status() == crate::source::OpenCtpSourceStatus::Degraded {
-                            let remaining = reconnect_state.remaining_until_reconnect_at(Instant::now());
-                            if !remaining.is_zero() {
-                                thread::sleep(remaining);
+                        if let Some(reconnect_gate) =
+                            reconnect_gate_for_front_connected(&reconnect_state, Instant::now())
+                        {
+                            if !reconnect_gate.sleep_for.is_zero() {
+                                let wakeup = after(reconnect_gate.sleep_for);
+                                select! {
+                                    recv(stop_rx) -> _ => {
+                                        stopping.store(true, Ordering::SeqCst);
+                                        release_api(api_holder);
+                                        return Ok(());
+                                    }
+                                    recv(wakeup) -> _ => {}
+                                }
                             }
-                            reconnect_state.mark_reconnected();
-                            tx.send(MdDriverEvent::ReconnectUpdate(reconnect_state.snapshot()))
-                                .map_err(|_| ZippyError::ChannelSend)?;
+                        }
+
+                        if stopping.load(Ordering::SeqCst) {
+                            release_api(api_holder);
+                            return Ok(());
                         }
 
                         let mut login = CThostFtdcReqUserLoginField::default();
@@ -320,6 +344,7 @@ fn run_live_driver_loop(
                         }
                     }
                     Ok(LiveMdControlEvent::UserLoginSucceeded) => {
+                        pending_subscription.reset();
                         let subscribe_result = {
                             let guard = api_holder.lock().unwrap();
                             let api = guard.as_ref().ok_or_else(|| ZippyError::Io {
@@ -340,12 +365,26 @@ fn run_live_driver_loop(
                         tx.send(MdDriverEvent::ReconnectUpdate(reconnect_state.snapshot()))
                             .map_err(|_| ZippyError::ChannelSend)?;
                     }
-                    Ok(LiveMdControlEvent::SubscriptionResponse { instrument_id, succeeded, is_last }) => {
-                        pending_subscription.observe(instrument_id, succeeded);
+                    Ok(LiveMdControlEvent::SubscriptionResponse {
+                        request_id,
+                        instrument_id,
+                        succeeded,
+                        is_last,
+                    }) => {
+                        pending_subscription.observe(request_id, instrument_id, succeeded);
                         if is_last {
-                            let outcome = pending_subscription.finish();
-                            tx.send(MdDriverEvent::SubscriptionOutcome(outcome))
-                                .map_err(|_| ZippyError::ChannelSend)?;
+                            if let Some(outcome) = pending_subscription.finish_and_reset(request_id) {
+                                if reconnect_state.status() == crate::source::OpenCtpSourceStatus::Degraded {
+                                    reconnect_state.mark_reconnected();
+                                    tx.send(MdDriverEvent::ReconnectUpdate(crate::source::ReconnectUpdate {
+                                        reconnects_total: reconnect_state.reconnects_total(),
+                                        status: outcome.status,
+                                    }))
+                                        .map_err(|_| ZippyError::ChannelSend)?;
+                                }
+                                tx.send(MdDriverEvent::SubscriptionOutcome(outcome))
+                                    .map_err(|_| ZippyError::ChannelSend)?;
+                            }
                         }
                     }
                     Ok(LiveMdControlEvent::DriverError(reason)) => {
@@ -366,9 +405,32 @@ fn run_live_driver_loop(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReconnectGate {
+    sleep_for: std::time::Duration,
+}
+
+impl ReconnectGate {
+}
+
+fn reconnect_gate_for_front_connected(
+    reconnect_state: &ReconnectState,
+    now: Instant,
+) -> Option<ReconnectGate> {
+    if reconnect_state.status() != crate::source::OpenCtpSourceStatus::Degraded {
+        return None;
+    }
+
+    Some(ReconnectGate {
+        sleep_for: reconnect_state.remaining_until_reconnect_at(now),
+    })
+}
+
 struct PendingSubscription {
     requested: Vec<String>,
     succeeded: Vec<String>,
+    active_request_id: Option<i32>,
+    sealed_request_ids: HashSet<i32>,
 }
 
 impl PendingSubscription {
@@ -376,10 +438,16 @@ impl PendingSubscription {
         Self {
             requested: requested.to_vec(),
             succeeded: Vec::new(),
+            active_request_id: None,
+            sealed_request_ids: HashSet::new(),
         }
     }
 
-    fn observe(&mut self, instrument_id: Option<String>, succeeded: bool) {
+    fn observe(&mut self, request_id: i32, instrument_id: Option<String>, succeeded: bool) {
+        if !self.try_accept_request(request_id) {
+            return;
+        }
+
         if !succeeded {
             return;
         }
@@ -395,8 +463,43 @@ impl PendingSubscription {
         self.succeeded.push(instrument_id);
     }
 
-    fn finish(&self) -> SubscriptionOutcome {
-        evaluate_subscription_results(self.requested.as_slice(), self.succeeded.as_slice())
+    fn finish_and_reset(&mut self, request_id: i32) -> Option<SubscriptionOutcome> {
+        if !self.try_accept_request(request_id) {
+            return None;
+        }
+
+        let outcome =
+            evaluate_subscription_results(self.requested.as_slice(), self.succeeded.as_slice());
+        self.reset_active_round(request_id);
+        Some(outcome)
+    }
+
+    fn reset(&mut self) {
+        if let Some(active_request_id) = self.active_request_id {
+            self.sealed_request_ids.insert(active_request_id);
+        }
+        self.active_request_id = None;
+        self.succeeded.clear();
+    }
+
+    fn try_accept_request(&mut self, request_id: i32) -> bool {
+        if self.sealed_request_ids.contains(&request_id) {
+            return false;
+        }
+
+        match self.active_request_id {
+            Some(active_request_id) => active_request_id == request_id,
+            None => {
+                self.active_request_id = Some(request_id);
+                true
+            }
+        }
+    }
+
+    fn reset_active_round(&mut self, request_id: i32) {
+        self.sealed_request_ids.insert(request_id);
+        self.active_request_id = None;
+        self.succeeded.clear();
     }
 }
 
@@ -443,4 +546,78 @@ fn rsp_info_error_reason(rsp_info: Option<&CThostFtdcRspInfoField>) -> Option<St
         "ctp md rsp error error_id=[{}] message=[{}]",
         rsp_info.ErrorID, detail
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{reconnect_gate_for_front_connected, PendingSubscription};
+    use std::time::{Duration, Instant};
+
+    use crate::source::{ReconnectState, SubscriptionOutcome};
+
+    #[test]
+    fn pending_subscription_ignores_delayed_completed_request_id_after_reset() {
+        let mut pending = PendingSubscription::new(&["IF2506".to_string(), "IH2506".to_string()]);
+
+        pending.observe(101, Some("IF2506".to_string()), true);
+        let first = pending
+            .finish_and_reset(101)
+            .expect("active request should produce subscription outcome");
+        assert_eq!(
+            first,
+            SubscriptionOutcome {
+                succeeded_instruments: vec!["IF2506".to_string()],
+                failed_instruments: vec!["IH2506".to_string()],
+                subscribe_failures_total: 1,
+                status: crate::source::OpenCtpSourceStatus::Degraded,
+            }
+        );
+
+        pending.observe(202, Some("IH2506".to_string()), true);
+        pending.observe(101, Some("IF2506".to_string()), true);
+        assert!(
+            pending.finish_and_reset(101).is_none(),
+            "completed old request_id must not emit a new outcome"
+        );
+
+        let second = pending
+            .finish_and_reset(202)
+            .expect("new request should remain isolated from delayed old responses");
+        assert_eq!(
+            second,
+            SubscriptionOutcome {
+                succeeded_instruments: vec!["IH2506".to_string()],
+                failed_instruments: vec!["IF2506".to_string()],
+                subscribe_failures_total: 1,
+                status: crate::source::OpenCtpSourceStatus::Degraded,
+            }
+        );
+    }
+
+    #[test]
+    fn reconnect_gate_waits_until_interval_before_recovering() {
+        let start = Instant::now();
+        let mut reconnect_state = ReconnectState::new(Duration::from_secs(3));
+        reconnect_state.mark_disconnected_at(start);
+
+        let reconnect_gate = reconnect_gate_for_front_connected(
+            &reconnect_state,
+            start + Duration::from_secs(1),
+        )
+        .expect("degraded source should produce reconnect gate");
+
+        assert_eq!(reconnect_gate.sleep_for, Duration::from_secs(2));
+        assert_eq!(reconnect_state.reconnects_total(), 0);
+        assert_eq!(
+            reconnect_state.status(),
+            crate::source::OpenCtpSourceStatus::Degraded
+        );
+
+        reconnect_state.mark_reconnected();
+        assert_eq!(reconnect_state.reconnects_total(), 1);
+        assert_eq!(
+            reconnect_state.status(),
+            crate::source::OpenCtpSourceStatus::Running
+        );
+    }
 }
