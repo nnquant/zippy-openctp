@@ -1,12 +1,20 @@
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
 use arrow::array::{
     ArrayRef, Float64Array, Int64Array, StringArray, TimestampNanosecondArray,
 };
 use arrow::record_batch::RecordBatch;
+use crossbeam_channel::{unbounded, Receiver, Sender};
+use zippy_core::{
+    Result as CoreResult, SchemaRef, Source, SourceEvent, SourceHandle, SourceMode, SourceSink,
+    StreamHello, ZippyError,
+};
 
+use crate::metrics::OpenCtpSourceMetrics;
 use crate::normalize::{normalize_tick, NormalizedTickRow, NormalizeError, RawTickSnapshot};
 use crate::schema::tick_data_schema;
 
@@ -168,6 +176,10 @@ impl BufferedTickEmitter {
         Ok(None)
     }
 
+    pub fn flush(&mut self) -> Result<Option<RecordBatch>, SourceError> {
+        self.flush_at(Instant::now())
+    }
+
     fn flush_at(&mut self, now: Instant) -> Result<Option<RecordBatch>, SourceError> {
         if self.buffer.is_empty() {
             return Ok(None);
@@ -212,6 +224,163 @@ impl FakeOpenCtpSourceRuntime {
 
     pub fn flush_if_due(&mut self, now: Instant) -> Result<Option<RecordBatch>, SourceError> {
         self.emitter.flush_if_due(now)
+    }
+}
+
+pub enum MdDriverEvent {
+    Tick(RawTickSnapshot),
+    Flush,
+    Stop,
+    Error(String),
+}
+
+type MdDriverStopFn = Box<dyn FnMut() -> CoreResult<()> + Send>;
+
+pub struct MdDriverHandle {
+    join_handle: JoinHandle<CoreResult<()>>,
+    stop_fn: Option<MdDriverStopFn>,
+}
+
+impl MdDriverHandle {
+    pub fn new(join_handle: JoinHandle<CoreResult<()>>) -> Self {
+        Self {
+            join_handle,
+            stop_fn: None,
+        }
+    }
+
+    pub fn new_with_stop(join_handle: JoinHandle<CoreResult<()>>, stop_fn: MdDriverStopFn) -> Self {
+        Self {
+            join_handle,
+            stop_fn: Some(stop_fn),
+        }
+    }
+
+    fn into_parts(self) -> (JoinHandle<CoreResult<()>>, Option<MdDriverStopFn>) {
+        (self.join_handle, self.stop_fn)
+    }
+}
+
+pub trait MdDriver: Send + 'static {
+    fn start(self: Box<Self>, tx: Sender<MdDriverEvent>) -> CoreResult<MdDriverHandle>;
+}
+
+pub struct FakeMdDriver {
+    rx: Receiver<MdDriverEvent>,
+}
+
+#[derive(Clone)]
+pub struct FakeMdDriverHandle {
+    tx: Sender<MdDriverEvent>,
+}
+
+impl FakeMdDriver {
+    pub fn pair() -> (Self, FakeMdDriverHandle) {
+        let (tx, rx) = unbounded();
+        (Self { rx }, FakeMdDriverHandle { tx })
+    }
+}
+
+impl MdDriver for FakeMdDriver {
+    fn start(self: Box<Self>, tx: Sender<MdDriverEvent>) -> CoreResult<MdDriverHandle> {
+        let join_handle = thread::spawn(move || -> CoreResult<()> {
+            while let Ok(event) = self.rx.recv() {
+                let should_stop = matches!(event, MdDriverEvent::Stop);
+                tx.send(event).map_err(|_| ZippyError::ChannelSend)?;
+                if should_stop {
+                    return Ok(());
+                }
+            }
+
+            Err(ZippyError::ChannelReceive)
+        });
+
+        Ok(MdDriverHandle::new(join_handle))
+    }
+}
+
+impl FakeMdDriverHandle {
+    pub fn emit_sample_sequence(&self) -> CoreResult<()> {
+        self.tx
+            .send(MdDriverEvent::Tick(sample_tick_snapshot()))
+            .map_err(|_| ZippyError::ChannelSend)?;
+        self.tx
+            .send(MdDriverEvent::Stop)
+            .map_err(|_| ZippyError::ChannelSend)
+    }
+}
+
+pub struct OpenCtpMarketDataSource {
+    config: OpenCtpMarketDataSourceConfig,
+    schema: SchemaRef,
+    metrics: Arc<Mutex<OpenCtpSourceMetrics>>,
+    driver: Box<dyn MdDriver>,
+}
+
+impl OpenCtpMarketDataSource {
+    pub fn from_driver(config: OpenCtpMarketDataSourceConfig, driver: Box<dyn MdDriver>) -> Self {
+        Self {
+            config,
+            schema: tick_data_schema(),
+            metrics: Arc::new(Mutex::new(OpenCtpSourceMetrics::default())),
+            driver,
+        }
+    }
+
+    pub fn metrics(&self) -> OpenCtpSourceMetrics {
+        self.metrics.lock().unwrap().clone()
+    }
+}
+
+impl Source for OpenCtpMarketDataSource {
+    fn name(&self) -> &str {
+        "openctp-market-data-source"
+    }
+
+    fn output_schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+
+    fn mode(&self) -> SourceMode {
+        SourceMode::Pipeline
+    }
+
+    fn start(self: Box<Self>, sink: Arc<dyn SourceSink>) -> CoreResult<SourceHandle> {
+        let Self {
+            config,
+            schema,
+            metrics,
+            driver,
+        } = *self;
+
+        sink.emit(SourceEvent::Hello(StreamHello::new("openctp.tick", schema.clone(), 1)?))?;
+
+        let (tx, rx) = unbounded();
+        let driver_handle = driver.start(tx)?;
+        let (driver_join_handle, driver_stop_fn) = driver_handle.into_parts();
+        let source_metrics = metrics.clone();
+
+        let join_handle = thread::spawn(move || -> CoreResult<()> {
+            let mut emitter = BufferedTickEmitter::new(
+                schema,
+                config.rows_per_batch,
+                config.flush_interval_ms,
+            );
+
+            let runtime_result = run_driver_event_loop(rx, sink, &mut emitter, &source_metrics);
+            let driver_result = join_driver_handle(driver_join_handle);
+
+            match (runtime_result, driver_result) {
+                (Err(err), _) => Err(err),
+                (Ok(()), Err(err)) => Err(err),
+                (Ok(()), Ok(())) => Ok(()),
+            }
+        });
+
+        match driver_stop_fn {
+            Some(stop_fn) => Ok(SourceHandle::new_with_stop(join_handle, stop_fn)),
+            None => Ok(SourceHandle::new(join_handle)),
+        }
     }
 }
 
@@ -270,4 +439,82 @@ fn normalized_rows_to_record_batch(
     ];
 
     RecordBatch::try_new(schema, columns).map_err(SourceError::from)
+}
+
+fn run_driver_event_loop(
+    rx: Receiver<MdDriverEvent>,
+    sink: Arc<dyn SourceSink>,
+    emitter: &mut BufferedTickEmitter,
+    metrics: &Arc<Mutex<OpenCtpSourceMetrics>>,
+) -> CoreResult<()> {
+    while let Ok(event) = rx.recv() {
+        match event {
+            MdDriverEvent::Tick(raw) => {
+                metrics.lock().unwrap().ticks_received_total += 1;
+                let row = normalize_tick(&raw).map_err(|error| map_source_error(error.into()))?;
+                if let Some(batch) = emitter.push_tick(row).map_err(map_source_error)? {
+                    record_batch_emission(metrics, &batch);
+                    sink.emit(SourceEvent::Data(batch))?;
+                }
+            }
+            MdDriverEvent::Flush => {
+                if let Some(batch) = emitter.flush().map_err(map_source_error)? {
+                    record_batch_emission(metrics, &batch);
+                    sink.emit(SourceEvent::Data(batch))?;
+                }
+                sink.emit(SourceEvent::Flush)?;
+            }
+            MdDriverEvent::Stop => {
+                if let Some(batch) = emitter.flush().map_err(map_source_error)? {
+                    record_batch_emission(metrics, &batch);
+                    sink.emit(SourceEvent::Data(batch))?;
+                }
+                sink.emit(SourceEvent::Stop)?;
+                return Ok(());
+            }
+            MdDriverEvent::Error(reason) => {
+                sink.emit(SourceEvent::Error(reason.clone()))?;
+                return Err(ZippyError::Io { reason });
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn record_batch_emission(metrics: &Arc<Mutex<OpenCtpSourceMetrics>>, batch: &RecordBatch) {
+    let mut metrics = metrics.lock().unwrap();
+    metrics.ticks_emitted_total += batch.num_rows() as u64;
+    metrics.batches_emitted_total += 1;
+}
+
+fn map_source_error(error: SourceError) -> ZippyError {
+    ZippyError::Io {
+        reason: error.to_string(),
+    }
+}
+
+fn join_driver_handle(join_handle: JoinHandle<CoreResult<()>>) -> CoreResult<()> {
+    join_handle.join().map_err(|_| ZippyError::Io {
+        reason: "md driver thread panicked".to_string(),
+    })?
+}
+
+fn sample_tick_snapshot() -> RawTickSnapshot {
+    RawTickSnapshot {
+        instrument_id: "IF2506".to_string(),
+        exchange_id: "CFFEX".to_string(),
+        trading_day: "20260408".to_string(),
+        action_day: "20260408".to_string(),
+        update_time: "09:30:00".to_string(),
+        update_millisec: 500,
+        last_price: 3912.4,
+        volume: 1,
+        turnover: 987654.0,
+        open_interest: 56789.0,
+        bid_price_1: 3912.2,
+        bid_volume_1: 10,
+        ask_price_1: 3912.6,
+        ask_volume_1: 8,
+    }
 }

@@ -9,3 +9,6 @@ path = "src/lib.rs"
 
 [dependencies]
 arrow = "53.3.0"
+crossbeam-channel = "0.5.15"
+zippy-core = { path = "../../../../crates/zippy-core" }
+ctp2rs = "0.1"
