@@ -1,11 +1,13 @@
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::Sender;
 use zippy_core::{Result as CoreResult, Source, SourceEvent, SourceSink};
 use zippy_openctp_core::source::{MdDriverEvent, MdDriverHandle};
 use zippy_openctp_core::{
-    MdDriver, OpenCtpMarketDataSource, OpenCtpMarketDataSourceConfig, RawTickSnapshot,
+    MdDriver, OpenCtpMarketDataSource, OpenCtpMarketDataSourceConfig, OpenCtpSourceStatus,
+    RawTickSnapshot,
 };
 
 #[derive(Default)]
@@ -48,6 +50,7 @@ enum RecordedEvent {
 
 struct FakeMdDriver {
     events: Vec<MdDriverEvent>,
+    delay_before_stop: Duration,
 }
 
 impl FakeMdDriver {
@@ -63,6 +66,9 @@ impl MdDriver for FakeMdDriver {
     fn start(self: Box<Self>, tx: Sender<MdDriverEvent>) -> CoreResult<MdDriverHandle> {
         let join_handle = thread::spawn(move || -> CoreResult<()> {
             for event in self.events {
+                if matches!(event, MdDriverEvent::Stop) {
+                    thread::sleep(self.delay_before_stop);
+                }
                 tx.send(event).map_err(|_| zippy_core::ZippyError::ChannelSend)?;
             }
             Ok(())
@@ -79,14 +85,22 @@ fn fake_md_driver_emits_data_and_stop_events() {
         default_source_config(),
         Box::new(FakeMdDriver {
             events: FakeMdDriver::sample_sequence(),
+            delay_before_stop: Duration::from_millis(50),
         }),
     );
+    let status = source.status_handle();
+
+    assert_eq!(*status.lock().unwrap(), OpenCtpSourceStatus::Created);
 
     let handle = Box::new(source)
         .start(sink.clone())
         .expect("source start should succeed");
 
+    wait_for_status(&status, OpenCtpSourceStatus::Running);
+
     handle.join().expect("source thread should exit cleanly");
+
+    assert_eq!(*status.lock().unwrap(), OpenCtpSourceStatus::Stopped);
 
     assert_eq!(
         sink.snapshot(),
@@ -98,6 +112,24 @@ fn fake_md_driver_emits_data_and_stop_events() {
             RecordedEvent::Stop,
         ]
     );
+}
+
+fn wait_for_status(
+    status: &Arc<Mutex<OpenCtpSourceStatus>>,
+    expected: OpenCtpSourceStatus,
+) {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        if *status.lock().unwrap() == expected {
+            return;
+        }
+
+        if Instant::now() >= deadline {
+            panic!("timed out waiting for status [{expected:?}]");
+        }
+
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn default_source_config() -> OpenCtpMarketDataSourceConfig {

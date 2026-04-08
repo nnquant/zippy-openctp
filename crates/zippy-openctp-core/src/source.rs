@@ -338,6 +338,7 @@ pub struct OpenCtpMarketDataSource {
     config: OpenCtpMarketDataSourceConfig,
     schema: SchemaRef,
     metrics: Arc<Mutex<OpenCtpSourceMetrics>>,
+    status: Arc<Mutex<OpenCtpSourceStatus>>,
     driver: Box<dyn MdDriver>,
 }
 
@@ -351,12 +352,21 @@ impl OpenCtpMarketDataSource {
             config,
             schema: tick_data_schema(),
             metrics: Arc::new(Mutex::new(OpenCtpSourceMetrics::default())),
+            status: Arc::new(Mutex::new(OpenCtpSourceStatus::Created)),
             driver,
         }
     }
 
     pub fn metrics(&self) -> OpenCtpSourceMetrics {
         self.metrics.lock().unwrap().clone()
+    }
+
+    pub fn status(&self) -> OpenCtpSourceStatus {
+        *self.status.lock().unwrap()
+    }
+
+    pub fn status_handle(&self) -> Arc<Mutex<OpenCtpSourceStatus>> {
+        self.status.clone()
     }
 }
 
@@ -378,29 +388,50 @@ impl Source for OpenCtpMarketDataSource {
             config,
             schema,
             metrics,
+            status,
             driver,
         } = *self;
 
-        sink.emit(SourceEvent::Hello(StreamHello::new("openctp.tick", schema.clone(), 1)?))?;
-
         let (tx, rx) = unbounded();
-        let driver_handle = driver.start(tx)?;
+        set_status(&status, OpenCtpSourceStatus::Connecting);
+        let driver_handle = match driver.start(tx) {
+            Ok(handle) => handle,
+            Err(error) => {
+                set_status(&status, OpenCtpSourceStatus::Failed);
+                return Err(error);
+            }
+        };
         let (driver_join_handle, driver_stop_fn) = driver_handle.into_parts();
         let source_metrics = metrics.clone();
+        let source_status = status.clone();
 
         let join_handle = thread::spawn(move || -> CoreResult<()> {
+            set_status(&source_status, OpenCtpSourceStatus::Running);
+            sink.emit(SourceEvent::Hello(StreamHello::new(
+                "openctp.tick",
+                schema.clone(),
+                1,
+            )?))?;
+
             let mut emitter = BufferedTickEmitter::new(
                 schema,
                 config.rows_per_batch,
                 config.flush_interval_ms,
             );
 
-            let runtime_result = run_driver_event_loop(rx, sink, &mut emitter, &source_metrics);
+            let runtime_result =
+                run_driver_event_loop(rx, sink, &mut emitter, &source_metrics, &source_status);
             let driver_result = join_driver_handle(driver_join_handle);
 
             match (runtime_result, driver_result) {
-                (Err(err), _) => Err(err),
-                (Ok(()), Err(err)) => Err(err),
+                (Err(err), _) => {
+                    set_status(&source_status, OpenCtpSourceStatus::Failed);
+                    Err(err)
+                }
+                (Ok(()), Err(err)) => {
+                    set_status(&source_status, OpenCtpSourceStatus::Failed);
+                    Err(err)
+                }
                 (Ok(()), Ok(())) => Ok(()),
             }
         });
@@ -474,6 +505,7 @@ fn run_driver_event_loop(
     sink: Arc<dyn SourceSink>,
     emitter: &mut BufferedTickEmitter,
     metrics: &Arc<Mutex<OpenCtpSourceMetrics>>,
+    status: &Arc<Mutex<OpenCtpSourceStatus>>,
 ) -> CoreResult<()> {
     while let Ok(event) = rx.recv() {
         match event {
@@ -497,10 +529,12 @@ fn run_driver_event_loop(
                     record_batch_emission(metrics, &batch);
                     sink.emit(SourceEvent::Data(batch))?;
                 }
+                set_status(status, OpenCtpSourceStatus::Stopped);
                 sink.emit(SourceEvent::Stop)?;
                 return Ok(());
             }
             MdDriverEvent::Error(reason) => {
+                set_status(status, OpenCtpSourceStatus::Failed);
                 sink.emit(SourceEvent::Error(reason.clone()))?;
                 return Err(ZippyError::Io { reason });
             }
@@ -526,6 +560,10 @@ fn join_driver_handle(join_handle: JoinHandle<CoreResult<()>>) -> CoreResult<()>
     join_handle.join().map_err(|_| ZippyError::Io {
         reason: "md driver thread panicked".to_string(),
     })?
+}
+
+fn set_status(status: &Arc<Mutex<OpenCtpSourceStatus>>, next: OpenCtpSourceStatus) {
+    *status.lock().unwrap() = next;
 }
 
 fn sample_tick_snapshot() -> RawTickSnapshot {
