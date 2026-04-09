@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::env;
+use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -12,6 +13,7 @@ use ctp2rs::v1alpha1::{
     CThostFtdcDepthMarketDataField, CThostFtdcReqUserLoginField, CThostFtdcRspInfoField, MdApi,
     MdApiBuilder, MdSpi,
 };
+use tracing::{debug, error, info, warn};
 use zippy_core::{Result as CoreResult, ZippyError};
 
 use crate::normalize::RawTickSnapshot;
@@ -23,6 +25,27 @@ use crate::source::{
 const DRIVER_UNIMPLEMENTED_REASON: &str = "ctp2rs live driver wiring is not implemented yet";
 const LOGIN_REQUEST_ID: i32 = 1;
 const RECONNECT_INTERVAL_SECS: u64 = 3;
+
+fn openctp_debug_enabled() -> bool {
+    match env::var("OPENCTP_DEBUG") {
+        Ok(value) => {
+            let normalized = value.trim().to_ascii_lowercase();
+            matches!(normalized.as_str(), "1" | "true" | "yes" | "on")
+        }
+        Err(_) => false,
+    }
+}
+
+fn openctp_debug_log(message: &str) {
+    if openctp_debug_enabled() {
+        debug!(
+            component = "openctp_source",
+            event = "debug",
+            message = message,
+            "{message}"
+        );
+    }
+}
 
 pub struct Ctp2rsMdDriver {
     config: OpenCtpMarketDataSourceConfig,
@@ -47,8 +70,17 @@ impl MdDriver for Ctp2rsMdDriver {
         let (stop_tx, stop_rx) = unbounded::<()>();
         let join_stopping = stopping.clone();
         let join_api_holder = api_holder.clone();
+        let join_front = config.front.clone();
+        let join_instruments = config.instruments.clone();
 
         let join_handle = thread::spawn(move || -> CoreResult<()> {
+            fs::create_dir_all(&config.flow_path).map_err(|error| ZippyError::Io {
+                reason: format!(
+                    "failed to create md flow path path=[{}] error=[{}]",
+                    config.flow_path, error
+                ),
+            })?;
+
             let api = MdApiBuilder::new()
                 .with_dynlib(&dynlib_path)
                 .flow_path(&config.flow_path)
@@ -58,6 +90,13 @@ impl MdDriver for Ctp2rsMdDriver {
                 .map_err(|reason| ZippyError::Io {
                     reason: format!("failed to build ctp md api: {reason}"),
                 })?;
+            info!(
+                component = "openctp_source",
+                event = "connect_start",
+                front = %join_front,
+                instrument_count = join_instruments.len(),
+                message = "starting market data connection"
+            );
 
             let (control_tx, control_rx) = unbounded();
             let spi = Box::new(LiveMdSpi::new(
@@ -104,6 +143,12 @@ impl MdDriver for Ctp2rsMdDriver {
             }
 
             if join_stopping.load(Ordering::SeqCst) {
+                openctp_debug_log("driver thread emitting MdDriverEvent::Stop");
+                info!(
+                    component = "openctp_source",
+                    event = "driver_stop",
+                    message = "market data driver emitted stop event"
+                );
                 tx.send(MdDriverEvent::Stop)
                     .map_err(|_| ZippyError::ChannelSend)?;
             }
@@ -111,13 +156,20 @@ impl MdDriver for Ctp2rsMdDriver {
             loop_result
         });
 
-        let stop_fn = {
-            let stop_tx = stop_tx.clone();
-            let stop_stopping = stopping.clone();
+            let stop_fn = {
+                let stop_tx = stop_tx.clone();
+                let stop_stopping = stopping.clone();
 
             Box::new(move || -> CoreResult<()> {
+                openctp_debug_log("driver stop_fn invoked");
                 stop_stopping.store(true, Ordering::SeqCst);
                 stop_tx.send(()).map_err(|_| ZippyError::ChannelSend)?;
+                openctp_debug_log("driver stop_fn sent stop signal");
+                info!(
+                    component = "openctp_source",
+                    event = "driver_stop_request",
+                    message = "market data driver stop requested"
+                );
 
                 Ok(())
             })
@@ -163,6 +215,12 @@ impl LiveMdSpi {
 
 impl MdSpi for LiveMdSpi {
     fn on_front_connected(&mut self) {
+        openctp_debug_log("spi on_front_connected");
+        info!(
+            component = "openctp_source",
+            event = "front_connected",
+            message = "market data front connected"
+        );
         let _ = self.control_tx.send(LiveMdControlEvent::FrontConnected);
     }
 
@@ -171,6 +229,13 @@ impl MdSpi for LiveMdSpi {
             return;
         }
 
+        openctp_debug_log(&format!("spi on_front_disconnected reason=[{reason}]"));
+        warn!(
+            component = "openctp_source",
+            event = "front_disconnected",
+            reason = reason,
+            message = "market data front disconnected"
+        );
         let _ = self
             .control_tx
             .send(LiveMdControlEvent::FrontDisconnected(reason));
@@ -188,10 +253,23 @@ impl MdSpi for LiveMdSpi {
         }
 
         if let Some(error) = rsp_info_error_reason(rsp_info) {
+            openctp_debug_log(&format!("spi on_rsp_user_login error=[{error}]"));
+            error!(
+                component = "openctp_source",
+                event = "login_failure",
+                error = %error,
+                message = "market data login failed"
+            );
             let _ = self.control_tx.send(LiveMdControlEvent::DriverError(error));
             return;
         }
 
+        openctp_debug_log("spi on_rsp_user_login success");
+        info!(
+            component = "openctp_source",
+            event = "login_success",
+            message = "market data login succeeded"
+        );
         let _ = self.control_tx.send(LiveMdControlEvent::UserLoginSucceeded);
     }
 
@@ -207,6 +285,13 @@ impl MdSpi for LiveMdSpi {
 
         let reason = rsp_info_error_reason(rsp_info)
             .unwrap_or_else(|| "ctp md rsp error without detailed info".to_string());
+        openctp_debug_log(&format!("spi on_rsp_error reason=[{reason}]"));
+        error!(
+            component = "openctp_source",
+            event = "rsp_error",
+            error = %reason,
+            message = "market data response error received"
+        );
         let _ = self
             .control_tx
             .send(LiveMdControlEvent::DriverError(reason));
@@ -223,6 +308,13 @@ impl MdSpi for LiveMdSpi {
         let raw = match raw_tick_from_depth_market_data(depth_market_data) {
             Ok(raw) => raw,
             Err(error) => {
+                openctp_debug_log(&format!("spi on_rtn_depth_market_data decode_error=[{}]", error));
+                error!(
+                    component = "openctp_source",
+                    event = "tick_decode_error",
+                    error = %error,
+                    message = "depth market data decode failed"
+                );
                 let _ = self
                     .control_tx
                     .send(LiveMdControlEvent::DriverError(error.to_string()));
@@ -230,6 +322,10 @@ impl MdSpi for LiveMdSpi {
             }
         };
 
+        openctp_debug_log(&format!(
+            "spi on_rtn_depth_market_data instrument_id=[{}] update_time=[{}]",
+            raw.instrument_id, raw.update_time
+        ));
         let _ = self.data_tx.send(MdDriverEvent::Tick(raw));
     }
 
@@ -243,6 +339,20 @@ impl MdSpi for LiveMdSpi {
         let instrument_id = specific_instrument
             .and_then(|instrument| decode_ctp_text(&instrument.InstrumentID).ok());
         let succeeded = rsp_info_error_reason(rsp_info).is_none();
+        openctp_debug_log(&format!(
+            "spi on_rsp_sub_market_data request_id=[{request_id}] instrument_id=[{}] succeeded=[{succeeded}] is_last=[{is_last}]",
+            instrument_id.as_deref().unwrap_or("<none>")
+        ));
+        if !succeeded {
+            warn!(
+                component = "openctp_source",
+                event = "subscribe_response_failure",
+                request_id = request_id,
+                instrument = %instrument_id.as_deref().unwrap_or("<none>"),
+                is_last = is_last,
+                message = "market data subscribe response reported failure"
+            );
+        }
 
         let _ = self
             .control_tx
@@ -261,9 +371,10 @@ fn release_api(api_holder: &Arc<std::sync::Mutex<Option<MdApi>>>) {
         guard.take()
     };
 
-    if let Some(api) = api {
-        api.release();
-    }
+    // ctp2rs 0.1.9 已经把 RegisterSpi(null) + Release + SPI 释放封装进 MdApi::drop。
+    // 这里如果显式再调一次 release()，随后 drop(api) 会重复走释放路径，
+    // live stop 时会把底层指针打坏。
+    drop(api);
 }
 
 fn resolve_live_md_dynlib_path() -> CoreResult<PathBuf> {
@@ -288,6 +399,18 @@ fn run_live_driver_loop(
     control_rx: &crossbeam_channel::Receiver<LiveMdControlEvent>,
     tx: &Sender<MdDriverEvent>,
 ) -> CoreResult<()> {
+    openctp_debug_log(&format!(
+        "driver loop started front=[{}] instruments=[{}]",
+        config.front,
+        config.instruments.join(",")
+    ));
+    info!(
+        component = "openctp_source",
+        event = "driver_loop_start",
+        front = %config.front,
+        instrument_count = config.instruments.len(),
+        message = "market data driver loop started"
+    );
     let mut pending_subscription = PendingSubscription::new(config.instruments.as_slice());
     let mut reconnect_state =
         ReconnectState::new(std::time::Duration::from_secs(RECONNECT_INTERVAL_SECS));
@@ -295,13 +418,21 @@ fn run_live_driver_loop(
     loop {
         select! {
             recv(stop_rx) -> _ => {
+                openctp_debug_log("driver loop received stop signal");
                 stopping.store(true, Ordering::SeqCst);
                 release_api(api_holder);
+                openctp_debug_log("driver loop released api on stop");
+                info!(
+                    component = "openctp_source",
+                    event = "driver_loop_stop",
+                    message = "market data driver loop stopped"
+                );
                 return Ok(());
             }
             recv(control_rx) -> event => {
                 match event {
                     Ok(LiveMdControlEvent::FrontConnected) => {
+                        openctp_debug_log("driver event FrontConnected");
                         if let Some(reconnect_gate) =
                             reconnect_gate_for_front_connected(&reconnect_state, Instant::now())
                         {
@@ -309,8 +440,10 @@ fn run_live_driver_loop(
                                 let wakeup = after(reconnect_gate.sleep_for);
                                 select! {
                                     recv(stop_rx) -> _ => {
+                                        openctp_debug_log("driver reconnect gate received stop signal");
                                         stopping.store(true, Ordering::SeqCst);
                                         release_api(api_holder);
+                                        openctp_debug_log("driver reconnect gate released api on stop");
                                         return Ok(());
                                     }
                                     recv(wakeup) -> _ => {}
@@ -335,15 +468,33 @@ fn run_live_driver_loop(
                             })?;
                             api.req_user_login(&mut login, LOGIN_REQUEST_ID)
                         };
+                        openctp_debug_log(&format!(
+                            "driver req_user_login broker_id=[{}] user_id=[{}] result=[{request_result}]",
+                            config.broker_id, config.user_id
+                        ));
+                        info!(
+                            component = "openctp_source",
+                            event = "login_request",
+                            broker_id = %config.broker_id,
+                            result = request_result,
+                            message = "market data login request sent"
+                        );
 
                         if request_result != 0 {
                             let reason = format!("ctp md req_user_login failed code=[{request_result}]");
+                            error!(
+                                component = "openctp_source",
+                                event = "login_request_failure",
+                                error = %reason,
+                                message = "market data login request failed"
+                            );
                             tx.send(MdDriverEvent::Error(reason.clone()))
                                 .map_err(|_| ZippyError::ChannelSend)?;
                             return Err(ZippyError::Io { reason });
                         }
                     }
                     Ok(LiveMdControlEvent::UserLoginSucceeded) => {
+                        openctp_debug_log("driver event UserLoginSucceeded");
                         pending_subscription.reset();
                         let subscribe_result = {
                             let guard = api_holder.lock().unwrap();
@@ -352,15 +503,39 @@ fn run_live_driver_loop(
                             })?;
                             api.subscribe_market_data(config.instruments.as_slice())
                         };
+                        openctp_debug_log(&format!(
+                            "driver subscribe_market_data instruments=[{}] result=[{subscribe_result}]",
+                            config.instruments.join(",")
+                        ));
+                        info!(
+                            component = "openctp_source",
+                            event = "subscribe_request",
+                            instrument_count = config.instruments.len(),
+                            result = subscribe_result,
+                            message = "market data subscribe request sent"
+                        );
 
                         if subscribe_result != 0 {
                             let reason = format!("ctp md subscribe_market_data failed code=[{subscribe_result}]");
+                            error!(
+                                component = "openctp_source",
+                                event = "subscribe_request_failure",
+                                error = %reason,
+                                message = "market data subscribe request failed"
+                            );
                             tx.send(MdDriverEvent::Error(reason.clone()))
                                 .map_err(|_| ZippyError::ChannelSend)?;
                             return Err(ZippyError::Io { reason });
                         }
                     }
                     Ok(LiveMdControlEvent::FrontDisconnected(_reason)) => {
+                        openctp_debug_log("driver event FrontDisconnected");
+                        warn!(
+                            component = "openctp_source",
+                            event = "reconnect",
+                            status = crate::source::OpenCtpSourceStatus::Degraded.as_str(),
+                            message = "market data driver entered reconnect state"
+                        );
                         reconnect_state.mark_disconnected_at(Instant::now());
                         tx.send(MdDriverEvent::ReconnectUpdate(reconnect_state.snapshot()))
                             .map_err(|_| ZippyError::ChannelSend)?;
@@ -371,6 +546,10 @@ fn run_live_driver_loop(
                         succeeded,
                         is_last,
                     }) => {
+                        openctp_debug_log(&format!(
+                            "driver event SubscriptionResponse request_id=[{request_id}] instrument_id=[{}] succeeded=[{succeeded}] is_last=[{is_last}]",
+                            instrument_id.as_deref().unwrap_or("<none>")
+                        ));
                         pending_subscription.observe(request_id, instrument_id, succeeded);
                         if is_last {
                             if let Some(outcome) = pending_subscription.finish_and_reset(request_id) {
@@ -388,6 +567,13 @@ fn run_live_driver_loop(
                         }
                     }
                     Ok(LiveMdControlEvent::DriverError(reason)) => {
+                        openctp_debug_log(&format!("driver event DriverError reason=[{reason}]"));
+                        error!(
+                            component = "openctp_source",
+                            event = "driver_error",
+                            error = %reason,
+                            message = "market data driver reported error"
+                        );
                         if stopping.load(Ordering::SeqCst) {
                             return Ok(());
                         }

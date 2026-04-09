@@ -9,6 +9,7 @@ use arrow::array::{
 };
 use arrow::record_batch::RecordBatch;
 use crossbeam_channel::{unbounded, Receiver, Sender};
+use tracing::{debug, error, info, warn};
 use zippy_core::{
     Result as CoreResult, SchemaRef, Source, SourceEvent, SourceHandle, SourceMode, SourceSink,
     StreamHello, ZippyError,
@@ -18,6 +19,27 @@ use crate::driver_ctp::Ctp2rsMdDriver;
 use crate::metrics::OpenCtpSourceMetrics;
 use crate::normalize::{normalize_tick, NormalizedTickRow, NormalizeError, RawTickSnapshot};
 use crate::schema::tick_data_schema;
+
+fn openctp_debug_enabled() -> bool {
+    match std::env::var("OPENCTP_DEBUG") {
+        Ok(value) => {
+            let normalized = value.trim().to_ascii_lowercase();
+            matches!(normalized.as_str(), "1" | "true" | "yes" | "on")
+        }
+        Err(_) => false,
+    }
+}
+
+fn openctp_debug_log(message: &str) {
+    if openctp_debug_enabled() {
+        debug!(
+            component = "openctp_source",
+            event = "debug",
+            message = message,
+            "{message}"
+        );
+    }
+}
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct OpenCtpMarketDataSourceConfig {
@@ -520,9 +542,19 @@ impl Source for OpenCtpMarketDataSource {
         let (driver_join_handle, driver_stop_fn) = driver_handle.into_parts();
         let source_metrics = metrics.clone();
         let source_status = status.clone();
+        let source_front = config.front.clone();
+        let source_instrument_count = config.instruments.len();
 
         let join_handle = thread::spawn(move || -> CoreResult<()> {
+            openctp_debug_log("source thread started");
             set_status(&source_status, OpenCtpSourceStatus::Running);
+            info!(
+                component = "openctp_source",
+                event = "source_start",
+                front = %source_front,
+                instrument_count = source_instrument_count,
+                message = "market data source thread started"
+            );
             sink.emit(SourceEvent::Hello(StreamHello::new(
                 "openctp.tick",
                 schema.clone(),
@@ -537,18 +569,40 @@ impl Source for OpenCtpMarketDataSource {
 
             let runtime_result =
                 run_driver_event_loop(rx, sink, &mut emitter, &source_metrics, &source_status);
+            openctp_debug_log(&format!("source thread runtime_result=[{}]", runtime_result.is_ok()));
             let driver_result = join_driver_handle(driver_join_handle);
+            openctp_debug_log(&format!("source thread driver_result=[{}]", driver_result.is_ok()));
 
             match (runtime_result, driver_result) {
                 (Err(err), _) => {
                     set_status(&source_status, OpenCtpSourceStatus::Failed);
+                    error!(
+                        component = "openctp_source",
+                        event = "source_failure",
+                        error = %err,
+                        message = "market data source thread failed"
+                    );
                     Err(err)
                 }
                 (Ok(()), Err(err)) => {
                     set_status(&source_status, OpenCtpSourceStatus::Failed);
+                    error!(
+                        component = "openctp_source",
+                        event = "driver_join_failure",
+                        error = %err,
+                        message = "market data driver join failed"
+                    );
                     Err(err)
                 }
-                (Ok(()), Ok(())) => Ok(()),
+                (Ok(()), Ok(())) => {
+                    info!(
+                        component = "openctp_source",
+                        event = "source_stop",
+                        status = OpenCtpSourceStatus::Stopped.as_str(),
+                        message = "market data source thread stopped"
+                    );
+                    Ok(())
+                }
             }
         });
 
@@ -634,15 +688,65 @@ fn run_driver_event_loop(
                 }
             }
             MdDriverEvent::SubscriptionOutcome(outcome) => {
+                openctp_debug_log(&format!(
+                    "source loop SubscriptionOutcome status=[{}] failures=[{}]",
+                    outcome.status.as_str(),
+                    outcome.subscribe_failures_total
+                ));
+                if outcome.subscribe_failures_total == 0 {
+                    info!(
+                        component = "openctp_source",
+                        event = "subscribe_success",
+                        succeeded_instruments = ?outcome.succeeded_instruments,
+                        message = "market data subscribe completed successfully"
+                    );
+                } else {
+                    warn!(
+                        component = "openctp_source",
+                        event = "subscribe_failure",
+                        succeeded_instruments = ?outcome.succeeded_instruments,
+                        failed_instruments = ?outcome.failed_instruments,
+                        subscribe_failures_total = outcome.subscribe_failures_total,
+                        message = "market data subscribe completed with failures"
+                    );
+                }
                 metrics.lock().unwrap().subscribe_failures_total +=
                     outcome.subscribe_failures_total;
                 set_status(status, outcome.status);
             }
             MdDriverEvent::ReconnectUpdate(update) => {
+                openctp_debug_log(&format!(
+                    "source loop ReconnectUpdate status=[{}] reconnects_total=[{}]",
+                    update.status.as_str(),
+                    update.reconnects_total
+                ));
+                match update.status {
+                    OpenCtpSourceStatus::Degraded => warn!(
+                        component = "openctp_source",
+                        event = "reconnect",
+                        reconnects_total = update.reconnects_total,
+                        status = update.status.as_str(),
+                        message = "market data source is reconnecting"
+                    ),
+                    OpenCtpSourceStatus::Running => info!(
+                        component = "openctp_source",
+                        event = "reconnect_success",
+                        reconnects_total = update.reconnects_total,
+                        status = update.status.as_str(),
+                        message = "market data source reconnected"
+                    ),
+                    _ => {}
+                }
                 metrics.lock().unwrap().reconnects_total = update.reconnects_total;
                 set_status(status, update.status);
             }
             MdDriverEvent::Flush => {
+                openctp_debug_log("source loop Flush");
+                debug!(
+                    component = "openctp_source",
+                    event = "flush",
+                    message = "market data source flush received"
+                );
                 if let Some(batch) = emitter.flush().map_err(map_source_error)? {
                     record_batch_emission(metrics, &batch);
                     sink.emit(SourceEvent::Data(batch))?;
@@ -650,22 +754,42 @@ fn run_driver_event_loop(
                 sink.emit(SourceEvent::Flush)?;
             }
             MdDriverEvent::Stop => {
+                openctp_debug_log("source loop Stop");
                 if let Some(batch) = emitter.flush().map_err(map_source_error)? {
                     record_batch_emission(metrics, &batch);
                     sink.emit(SourceEvent::Data(batch))?;
                 }
                 set_status(status, OpenCtpSourceStatus::Stopped);
+                info!(
+                    component = "openctp_source",
+                    event = "stop",
+                    status = OpenCtpSourceStatus::Stopped.as_str(),
+                    message = "market data source stop received"
+                );
                 sink.emit(SourceEvent::Stop)?;
                 return Ok(());
             }
             MdDriverEvent::Error(reason) => {
+                openctp_debug_log(&format!("source loop Error reason=[{reason}]"));
                 set_status(status, OpenCtpSourceStatus::Failed);
+                error!(
+                    component = "openctp_source",
+                    event = "source_error",
+                    error = %reason,
+                    message = "market data source received driver error"
+                );
                 sink.emit(SourceEvent::Error(reason.clone()))?;
                 return Err(ZippyError::Io { reason });
             }
         }
     }
 
+    openctp_debug_log("source loop channel closed");
+    warn!(
+        component = "openctp_source",
+        event = "channel_closed",
+        message = "market data source event channel closed"
+    );
     Ok(())
 }
 
