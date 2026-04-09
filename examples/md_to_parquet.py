@@ -1,5 +1,5 @@
 """
-Minimal live market-data-to-parquet pipeline example for zippy-openctp.
+Minimal live market-data-to-stream-table-to-parquet pipeline example for zippy-openctp.
 """
 
 import argparse
@@ -8,9 +8,9 @@ import time
 import zippy
 import zippy_openctp
 
-DEFAULT_INSTRUMENTS = "IF2506"
+DEFAULT_INSTRUMENTS = "IF2606"
 DEFAULT_FLOW_PATH = ".cache/openctp/md"
-DEFAULT_OUTPUT_PATH = "data/openctp_bars"
+DEFAULT_OUTPUT_PATH = "data/openctp_ticks"
 
 
 def _parse_instruments(raw: str) -> list[str]:
@@ -37,7 +37,7 @@ def parse_args() -> argparse.Namespace:
     :rtype: argparse.Namespace
     """
     parser = argparse.ArgumentParser(
-        description="run a live OpenCTP -> 1m bars -> parquet pipeline",
+        description="run a live OpenCTP -> stream table -> parquet pipeline",
     )
     parser.add_argument("--front", required=True, help="OpenCTP market data front address")
     parser.add_argument("--broker-id", required=True, help="broker identifier")
@@ -97,9 +97,9 @@ def build_source(args: argparse.Namespace) -> zippy_openctp.OpenCtpMarketDataSou
 def build_pipeline(
     args: argparse.Namespace,
     source: zippy_openctp.OpenCtpMarketDataSource | None = None,
-) -> zippy.TimeSeriesEngine:
+) -> zippy.StreamTableEngine:
     """
-    Build a local OpenCTP tick -> 1m bars -> Parquet archive pipeline.
+    Build a local OpenCTP tick -> stream table -> Parquet archive pipeline.
 
     :param args: Parsed command-line arguments.
     :type args: argparse.Namespace
@@ -107,31 +107,22 @@ def build_pipeline(
         inspect config, status, or metrics before starting the engine.
     :type source: zippy_openctp.OpenCtpMarketDataSource | None
     :returns: Configured time-series engine ready to be started by the caller.
-    :rtype: zippy.TimeSeriesEngine
+    :rtype: zippy.StreamTableEngine
     """
     source = source or build_source(args)
     archive = zippy.ParquetSink(
         path=args.output_path,
         write_output=True,
+        rows_per_batch=8192,
+        flush_interval_ms=1000,
     )
 
-    return zippy.TimeSeriesEngine(
-        name="openctp_bar_1m",
+    return zippy.StreamTableEngine(
+        name="openctp_tick_table",
         source=source,
         input_schema=zippy_openctp.schemas.TickDataSchema(),
-        id_column="instrument_id",
-        dt_column="dt",
-        window=zippy.Duration.minutes(1),
-        window_type=zippy.WindowType.TUMBLING,
-        late_data_policy=zippy.LateDataPolicy.REJECT,
-        factors=[
-            zippy.AGG_FIRST(column="last_price", output="open"),
-            zippy.AGG_LAST(column="last_price", output="close"),
-            zippy.AGG_MAX(column="last_price", output="high"),
-            zippy.AGG_MIN(column="last_price", output="low"),
-        ],
         target=zippy.NullPublisher(),
-        parquet_sink=archive,
+        sink=archive,
     )
 
 
@@ -143,14 +134,14 @@ if __name__ == "__main__":
     print("source metrics before start:", source.metrics())
     engine = build_pipeline(cli_args, source)
     print("engine output schema:", engine.output_schema())
-    print("starting live parquet pipeline; press Ctrl-C to stop")
+    print("starting live stream-table parquet pipeline; press Ctrl-C to stop")
     engine.start()
     try:
         while True:
             print("source status:", source.status(), "source metrics:", source.metrics())
             time.sleep(1.0)
     except KeyboardInterrupt:
-        print("stopping parquet pipeline")
+        print("stopping stream-table parquet pipeline")
     finally:
         engine.stop()
         print("source status after stop:", source.status())

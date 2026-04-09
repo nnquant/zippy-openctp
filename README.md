@@ -12,7 +12,7 @@ import zippy_openctp
 
 instruments = [
     item.strip()
-    for item in os.getenv("OPENCTP_INSTRUMENTS", "IF2506").split(",")
+    for item in os.getenv("OPENCTP_INSTRUMENTS", "IF2606").split(",")
     if item.strip()
 ]
 
@@ -25,20 +25,21 @@ source = zippy_openctp.OpenCtpMarketDataSource(
     flow_path=".cache/openctp/md",
 )
 
-bars = zippy.TimeSeriesEngine(
-    name="openctp_bar_1m",
+table = zippy.StreamTableEngine(
+    name="openctp_ticks",
     source=source,
     input_schema=zippy_openctp.schemas.TickDataSchema(),
-    id_column="instrument_id",
-    dt_column="dt",
-    window=zippy.Duration.minutes(1),
-    window_type=zippy.WindowType.TUMBLING,
-    late_data_policy=zippy.LateDataPolicy.REJECT,
-    factors=[
-        zippy.AGG_FIRST(column="last_price", output="open"),
-        zippy.AGG_LAST(column="last_price", output="close"),
-    ],
-    target=zippy.NullPublisher(),
+    target=zippy.ZmqStreamPublisher(
+        endpoint="tcp://127.0.0.1:7001",
+        stream_name="openctp_ticks",
+        schema=zippy_openctp.schemas.TickDataSchema(),
+    ),
+    sink=zippy.ParquetSink(
+        path="data/openctp_ticks",
+        write_output=True,
+        rows_per_batch=8192,
+        flush_interval_ms=1000,
+    ),
 )
 ```
 
@@ -62,7 +63,7 @@ uv run python examples/md_to_remote_pipeline.py --help
 - `--password`
 - `--instruments`
 
-其中 `--instruments` 是可选项，格式为逗号分隔；未传时默认订阅 `IF2506`。
+其中 `--instruments` 是可选项，格式为逗号分隔；未传时默认订阅 `IF2606`。
 
 ### 1. 先做语法 smoke
 
@@ -74,7 +75,7 @@ uv run python -m py_compile examples/md_to_parquet.py examples/md_to_remote_pipe
 
 ### 2. 做 live source 联调
 
-本地落盘验证：
+本地原始 tick 落盘验证：
 
 ```bash
 uv run python examples/md_to_parquet.py \
@@ -82,10 +83,10 @@ uv run python examples/md_to_parquet.py \
   --broker-id '9999' \
   --user-id '000001' \
   --password 'secret' \
-  --instruments 'IF2506,IH2506'
+  --instruments 'IF2606,IH2606'
 ```
 
-远程分发验证：
+原始 tick 数据中心验证：
 
 ```bash
 uv run python examples/md_to_remote_pipeline.py \
@@ -93,9 +94,9 @@ uv run python examples/md_to_remote_pipeline.py \
   --broker-id '9999' \
   --user-id '000001' \
   --password 'secret' \
-  --instruments 'IF2506,IH2506' \
+  --instruments 'IF2606,IH2606' \
   --stream-endpoint 'tcp://127.0.0.1:7001' \
-  --stream-name 'openctp_bar_1m'
+  --stream-name 'openctp_ticks'
 ```
 
 这两个脚本都会：
@@ -106,9 +107,9 @@ uv run python examples/md_to_remote_pipeline.py \
 - 持续打印运行期 `source.status()` 与 `source.metrics()`
 - 在 `Ctrl-C` 后执行 `engine.stop()`
 
-`examples/md_to_parquet.py` 会把 1 分钟 bar 写到 `data/openctp_bars`。  
-`examples/md_to_remote_pipeline.py` 会把 1 分钟 bar 发布到 `tcp://127.0.0.1:7001`，供下游 `ZmqSource`
-或订阅程序继续消费。
+`examples/md_to_parquet.py` 会把原始 tick 写到 `data/openctp_ticks`。  
+`examples/md_to_remote_pipeline.py` 会把原始 tick 同时写到 `data/openctp_ticks_remote`，并发布到
+`tcp://127.0.0.1:7001`，供下游 `ZmqSource`、`StreamTableEngine` 或其他订阅程序继续消费。
 
 ### 3. 观察 `source.status()` / `source.metrics()`
 
@@ -135,7 +136,7 @@ uv run python examples/md_to_remote_pipeline.py \
 1. 启动前是 `created`，且 metrics 全零。
 2. 运行 example 后状态从 `connecting` 进入 `running`，或在部分订阅失败时进入 `degraded`。
 3. 有真实行情流入时，`ticks_received_total` 与 `ticks_emitted_total` 持续增加。
-4. `md_to_parquet.py` 写出 parquet 文件，或 `md_to_remote_pipeline.py` 的下游 pipeline 能收到数据。
+4. `md_to_parquet.py` 写出原始 tick parquet 文件，或 `md_to_remote_pipeline.py` 的下游 pipeline 能收到原始 tick 流。
 5. `Ctrl-C` 后状态收敛到 `stopped`。
 
 ## Status

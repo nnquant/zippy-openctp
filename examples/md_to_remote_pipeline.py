@@ -1,8 +1,8 @@
 """
 Minimal remote market-data fanout example for zippy-openctp.
 
-This file demonstrates how an OpenCTP source can feed a local bar engine and
-then publish its output to another process through zippy's stream publisher.
+This file demonstrates how an OpenCTP source can feed a local stream table,
+persist raw ticks, and then publish the same raw stream to another process.
 """
 
 import argparse
@@ -11,10 +11,11 @@ import time
 import zippy
 import zippy_openctp
 
-DEFAULT_INSTRUMENTS = "IF2506"
+DEFAULT_INSTRUMENTS = "IF2606"
 DEFAULT_FLOW_PATH = ".cache/openctp/md"
 DEFAULT_STREAM_ENDPOINT = "tcp://127.0.0.1:7001"
-DEFAULT_STREAM_NAME = "openctp_bar_1m"
+DEFAULT_STREAM_NAME = "openctp_ticks"
+DEFAULT_OUTPUT_PATH = "data/openctp_ticks_remote"
 
 
 def _parse_instruments(raw: str) -> list[str]:
@@ -41,7 +42,7 @@ def parse_args() -> argparse.Namespace:
     :rtype: argparse.Namespace
     """
     parser = argparse.ArgumentParser(
-        description="run a live OpenCTP -> 1m bars -> zmq stream pipeline",
+        description="run a live OpenCTP -> stream table -> zmq stream pipeline",
     )
     parser.add_argument("--front", required=True, help="OpenCTP market data front address")
     parser.add_argument("--broker-id", required=True, help="broker identifier")
@@ -79,6 +80,11 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_STREAM_NAME,
         help=f"stream name, default [{DEFAULT_STREAM_NAME}]",
     )
+    parser.add_argument(
+        "--output-path",
+        default=DEFAULT_OUTPUT_PATH,
+        help=f"Parquet output directory, default [{DEFAULT_OUTPUT_PATH}]",
+    )
     return parser.parse_args()
 
 
@@ -103,34 +109,9 @@ def build_source(args: argparse.Namespace) -> zippy_openctp.OpenCtpMarketDataSou
     )
 
 
-def build_bar_schema() -> object:
-    """
-    Build the output schema for the 1m bar stream.
-
-    :returns: Time-series output schema for the remote stream.
-    :rtype: object
-    """
-    schema_probe = zippy.TimeSeriesEngine(
-        name="openctp_bar_stream_probe",
-        input_schema=zippy_openctp.schemas.TickDataSchema(),
-        id_column="instrument_id",
-        dt_column="dt",
-        window=zippy.Duration.minutes(1),
-        window_type=zippy.WindowType.TUMBLING,
-        late_data_policy=zippy.LateDataPolicy.REJECT,
-        factors=[
-            zippy.AGG_FIRST(column="last_price", output="open"),
-            zippy.AGG_LAST(column="last_price", output="close"),
-            zippy.AGG_SUM(column="volume", output="volume"),
-        ],
-        target=zippy.NullPublisher(),
-    )
-    return schema_probe.output_schema()
-
-
 def build_target(args: argparse.Namespace) -> zippy.ZmqStreamPublisher:
     """
-    Build the remote stream publisher for bar fanout.
+    Build the remote stream publisher for raw tick fanout.
 
     :returns: Configured stream publisher.
     :rtype: zippy.ZmqStreamPublisher
@@ -138,7 +119,7 @@ def build_target(args: argparse.Namespace) -> zippy.ZmqStreamPublisher:
     return zippy.ZmqStreamPublisher(
         endpoint=args.stream_endpoint,
         stream_name=args.stream_name,
-        schema=build_bar_schema(),
+        schema=zippy_openctp.schemas.TickDataSchema(),
     )
 
 
@@ -146,9 +127,9 @@ def build_pipeline(
     args: argparse.Namespace,
     source: zippy_openctp.OpenCtpMarketDataSource | None = None,
     target: zippy.ZmqStreamPublisher | None = None,
-) -> zippy.TimeSeriesEngine:
+) -> zippy.StreamTableEngine:
     """
-    Build an OpenCTP tick -> 1m bars -> remote ZMQ stream pipeline.
+    Build an OpenCTP tick -> stream table -> remote ZMQ stream pipeline.
 
     :param args: Parsed command-line arguments.
     :type args: argparse.Namespace
@@ -159,26 +140,23 @@ def build_pipeline(
         inspect the bound endpoint before starting the engine.
     :type target: zippy.ZmqStreamPublisher | None
     :returns: Configured time-series engine ready to be started by the caller.
-    :rtype: zippy.TimeSeriesEngine
+    :rtype: zippy.StreamTableEngine
     """
     source = source or build_source(args)
     target = target or build_target(args)
+    sink = zippy.ParquetSink(
+        path=args.output_path,
+        write_output=True,
+        rows_per_batch=8192,
+        flush_interval_ms=1000,
+    )
 
-    return zippy.TimeSeriesEngine(
-        name="openctp_bar_stream",
+    return zippy.StreamTableEngine(
+        name="openctp_tick_table_remote",
         source=source,
         input_schema=zippy_openctp.schemas.TickDataSchema(),
-        id_column="instrument_id",
-        dt_column="dt",
-        window=zippy.Duration.minutes(1),
-        window_type=zippy.WindowType.TUMBLING,
-        late_data_policy=zippy.LateDataPolicy.REJECT,
-        factors=[
-            zippy.AGG_FIRST(column="last_price", output="open"),
-            zippy.AGG_LAST(column="last_price", output="close"),
-            zippy.AGG_SUM(column="volume", output="volume"),
-        ],
         target=target,
+        sink=sink,
     )
 
 
@@ -192,14 +170,14 @@ if __name__ == "__main__":
     print("stream endpoint:", target.last_endpoint())
     engine = build_pipeline(cli_args, source, target)
     print("engine output schema:", engine.output_schema())
-    print("starting live remote pipeline; press Ctrl-C to stop")
+    print("starting live stream-table remote pipeline; press Ctrl-C to stop")
     engine.start()
     try:
         while True:
             print("source status:", source.status(), "source metrics:", source.metrics())
             time.sleep(1.0)
     except KeyboardInterrupt:
-        print("stopping remote pipeline")
+        print("stopping stream-table remote pipeline")
     finally:
         engine.stop()
         print("source status after stop:", source.status())
