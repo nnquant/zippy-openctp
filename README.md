@@ -47,17 +47,22 @@ bars = zippy.TimeSeriesEngine(
 
 ## Live Source 手工验证
 
-先用环境变量配置真实 OpenCTP 参数：
+两个 example 现在都通过命令行参数接收真实 OpenCTP 配置，不再依赖环境变量。
 
 ```bash
-export OPENCTP_MD_FRONT='tcp://127.0.0.1:12345'
-export OPENCTP_BROKER_ID='9999'
-export OPENCTP_USER_ID='000001'
-export OPENCTP_PASSWORD='secret'
-export OPENCTP_INSTRUMENTS='IF2506,IH2506'
+uv run python examples/md_to_parquet.py --help
+uv run python examples/md_to_remote_pipeline.py --help
 ```
 
-其中 `OPENCTP_INSTRUMENTS` 是可选项，格式为逗号分隔；未设置时，示例默认订阅 `IF2506`。
+两个脚本共同需要的核心参数是：
+
+- `--front`
+- `--broker-id`
+- `--user-id`
+- `--password`
+- `--instruments`
+
+其中 `--instruments` 是可选项，格式为逗号分隔；未传时默认订阅 `IF2506`。
 
 ### 1. 先做语法 smoke
 
@@ -72,13 +77,25 @@ uv run python -m py_compile examples/md_to_parquet.py examples/md_to_remote_pipe
 本地落盘验证：
 
 ```bash
-uv run python examples/md_to_parquet.py
+uv run python examples/md_to_parquet.py \
+  --front 'tcp://127.0.0.1:12345' \
+  --broker-id '9999' \
+  --user-id '000001' \
+  --password 'secret' \
+  --instruments 'IF2506,IH2506'
 ```
 
 远程分发验证：
 
 ```bash
-uv run python examples/md_to_remote_pipeline.py
+uv run python examples/md_to_remote_pipeline.py \
+  --front 'tcp://127.0.0.1:12345' \
+  --broker-id '9999' \
+  --user-id '000001' \
+  --password 'secret' \
+  --instruments 'IF2506,IH2506' \
+  --stream-endpoint 'tcp://127.0.0.1:7001' \
+  --stream-name 'openctp_bar_1m'
 ```
 
 这两个脚本都会：
