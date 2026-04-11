@@ -19,7 +19,7 @@ fn ctp_driver_keeps_static_subscription_config() {
 }
 
 #[test]
-fn ctp_driver_start_fails_explicitly_until_live_wiring_is_implemented() {
+fn ctp_driver_start_fails_when_md_dynlib_path_is_not_configured() {
     let config = OpenCtpMarketDataSourceConfig::new(
         "tcp://127.0.0.1:12345".to_string(),
         "9999".to_string(),
@@ -31,12 +31,12 @@ fn ctp_driver_start_fails_explicitly_until_live_wiring_is_implemented() {
     let (tx, _rx) = unbounded();
 
     let error = match Box::new(Ctp2rsMdDriver::new(config)).start(tx) {
-        Ok(_) => panic!("live driver shell should fail explicitly before Task 3"),
+        Ok(_) => panic!("driver start should fail when md dynlib path is not configured"),
         Err(error) => error,
     };
 
     assert!(matches!(error, ZippyError::Io { .. }));
     assert!(error
         .to_string()
-        .contains("ctp2rs live driver wiring is not implemented yet"));
+        .contains("openctp md dynlib path is not configured"));
 }

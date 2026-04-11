@@ -22,7 +22,8 @@ use crate::source::{
     OpenCtpMarketDataSourceConfig, ReconnectState, SubscriptionOutcome,
 };
 
-const DRIVER_UNIMPLEMENTED_REASON: &str = "ctp2rs live driver wiring is not implemented yet";
+const DRIVER_DYNLIB_NOT_CONFIGURED_REASON: &str =
+    "openctp md dynlib path is not configured set one of [OPENCTP_MD_DYNLIB_PATH, OPENCTP_MD_DYNLIB_DIR]";
 const LOGIN_REQUEST_ID: i32 = 1;
 const RECONNECT_INTERVAL_SECS: u64 = 3;
 
@@ -387,7 +388,7 @@ fn resolve_live_md_dynlib_path() -> CoreResult<PathBuf> {
     }
 
     Err(ZippyError::Io {
-        reason: DRIVER_UNIMPLEMENTED_REASON.to_string(),
+        reason: DRIVER_DYNLIB_NOT_CONFIGURED_REASON.to_string(),
     })
 }
 
