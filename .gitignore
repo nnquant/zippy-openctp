@@ -5,3 +5,6 @@ build/
 __pycache__/
 .pytest_cache/
 python/zippy_openctp/*.so
+.cache/
+data/
+logs/

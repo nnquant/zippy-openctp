@@ -11,6 +11,9 @@ import zippy_openctp
 DEFAULT_INSTRUMENTS = "IF2606"
 DEFAULT_FLOW_PATH = ".cache/openctp/md"
 DEFAULT_OUTPUT_PATH = "data/openctp_ticks"
+DEFAULT_LOG_DIR = "logs"
+DEFAULT_LOG_LEVEL = "info"
+DEFAULT_METRICS_INTERVAL_SEC = 5.0
 
 
 def _parse_instruments(raw: str) -> list[str]:
@@ -70,7 +73,31 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="max batch flush interval in milliseconds, default [0]",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--log-dir",
+        default=DEFAULT_LOG_DIR,
+        help=f"log root directory, default [{DEFAULT_LOG_DIR}]",
+    )
+    parser.add_argument(
+        "--log-level",
+        default=DEFAULT_LOG_LEVEL,
+        help=f"log level, default [{DEFAULT_LOG_LEVEL}]",
+    )
+    parser.add_argument(
+        "--no-console-log",
+        action="store_true",
+        help="disable console log output and keep file logging only",
+    )
+    parser.add_argument(
+        "--metrics-interval-sec",
+        type=float,
+        default=DEFAULT_METRICS_INTERVAL_SEC,
+        help=f"heartbeat metrics interval in seconds, default [{DEFAULT_METRICS_INTERVAL_SEC}]",
+    )
+    args = parser.parse_args()
+    if args.metrics_interval_sec <= 0:
+        parser.error("--metrics-interval-sec must be positive")
+    return args
 
 
 def build_source(args: argparse.Namespace) -> zippy_openctp.OpenCtpMarketDataSource:
@@ -128,21 +155,56 @@ def build_pipeline(
 
 if __name__ == "__main__":
     cli_args = parse_args()
+    log_snapshot = zippy.setup_log(
+        app="openctp_md_to_parquet",
+        level=cli_args.log_level,
+        log_dir=cli_args.log_dir,
+        to_console=not cli_args.no_console_log,
+        to_file=True,
+    )
+    zippy.log_info("openctp_example", "log_setup", f"initialized zippy logging log_snapshot=[{log_snapshot}]")
     source = build_source(cli_args)
-    print("source config:", source.config())
-    print("source status before start:", source.status())
-    print("source metrics before start:", source.metrics())
+    zippy.log_info("openctp_example", "source_config", f"built openctp source source_config=[{source.config()}]")
+    zippy.log_info(
+        "openctp_example",
+        "source_state",
+        f"source metrics before start metrics=[{source.metrics()}]",
+        status=source.status(),
+    )
     engine = build_pipeline(cli_args, source)
-    print("engine output schema:", engine.output_schema())
-    print("starting live stream-table parquet pipeline; press Ctrl-C to stop")
+    zippy.log_info(
+        "openctp_example",
+        "pipeline_schema",
+        f"built stream table pipeline output_schema=[{engine.output_schema()}]",
+    )
+    zippy.log_info("openctp_example", "start", "starting live stream-table parquet pipeline")
     engine.start()
     try:
         while True:
-            print("source status:", source.status(), "source metrics:", source.metrics())
-            time.sleep(1.0)
+            zippy.log_info(
+                "openctp_example",
+                "source_heartbeat",
+                f"source metrics heartbeat metrics=[{source.metrics()}]",
+                status=source.status(),
+            )
+            zippy.log_info(
+                "openctp_example",
+                "engine_heartbeat",
+                f"engine metrics heartbeat metrics=[{engine.metrics()}]",
+                status=engine.status(),
+            )
+            time.sleep(cli_args.metrics_interval_sec)
     except KeyboardInterrupt:
-        print("stopping stream-table parquet pipeline")
+        zippy.log_info(
+            "openctp_example",
+            "stop_request",
+            "stopping stream-table parquet pipeline after keyboard interrupt",
+        )
     finally:
         engine.stop()
-        print("source status after stop:", source.status())
-        print("source metrics after stop:", source.metrics())
+        zippy.log_info(
+            "openctp_example",
+            "source_state",
+            f"source metrics after stop metrics=[{source.metrics()}]",
+            status=source.status(),
+        )

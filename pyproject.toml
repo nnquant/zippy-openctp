@@ -7,9 +7,15 @@ name = "zippy-openctp"
 version = "0.1.0"
 description = "Python-first OpenCTP market data plugin for zippy"
 requires-python = ">=3.11"
-dependencies = ["pyarrow>=18"]
+dependencies = [
+    "pyarrow>=18",
+    "zippy",
+]
 
 [tool.maturin]
 module-name = "zippy_openctp._internal"
 python-source = "python"
 manifest-path = "crates/zippy-openctp-python/Cargo.toml"
+
+[tool.uv.sources]
+zippy = { path = "../../", editable = true }
