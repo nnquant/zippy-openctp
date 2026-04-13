@@ -111,6 +111,8 @@ uv run python examples/subscribe_mid_price_factors.py --help
 - `--stream-name`
 - `--source-stream-name`
 - `--output-stream-name`
+- `--buffer-size`
+- `--frame-size`
 
 ### 1. 先做语法 smoke
 
@@ -150,6 +152,8 @@ uv run python examples/md_to_remote_pipeline.py \
   --start-master \
   --control-endpoint '~/.zippy/master.sock' \
   --stream-name 'openctp_ticks' \
+  --buffer-size 131072 \
+  --frame-size 4096 \
   --log-dir 'logs'
 ```
 
@@ -188,6 +192,8 @@ uv run python examples/remote_mid_price_diff_200_std_200.py \
   --output-stream-name 'openctp_mid_price_factors' \
   --output-path 'data/openctp_mid_price_factors' \
   --id-filter 'IF2606,IH2606' \
+  --buffer-size 131072 \
+  --frame-size 4096 \
   --log-dir 'logs' \
   --metrics-interval-sec 5
 ```
@@ -216,6 +222,8 @@ uv run python examples/subscribe_mid_price_factors.py \
 - `dt`
 - `mid_price`
 - `MID_PRICE_DIFF_200_STD_200`
+
+这个订阅脚本不负责创建 stream，因此不需要 `--buffer-size` 或 `--frame-size`。
 
 ### 5. 观察 `source.status()` / `source.metrics()`
 

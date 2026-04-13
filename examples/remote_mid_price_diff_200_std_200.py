@@ -20,7 +20,8 @@ DEFAULT_OUTPUT_PATH = "data/openctp_mid_price_factors"
 DEFAULT_LOG_DIR = "logs"
 DEFAULT_LOG_LEVEL = "info"
 DEFAULT_METRICS_INTERVAL_SEC = 5.0
-DEFAULT_RING_CAPACITY = 131072
+DEFAULT_BUFFER_SIZE = 131072
+DEFAULT_FRAME_SIZE = 4096
 
 
 def parse_id_filter(value: str | None) -> list[str] | None:
@@ -99,16 +100,24 @@ def parse_args() -> argparse.Namespace:
         help="optional comma-separated instrument whitelist for factor computation",
     )
     parser.add_argument(
-        "--ring-capacity",
+        "--buffer-size",
         type=int,
-        default=DEFAULT_RING_CAPACITY,
-        help=f"ring capacity used when creating the factor output stream, default [{DEFAULT_RING_CAPACITY}]",
+        default=DEFAULT_BUFFER_SIZE,
+        help=f"buffer size used when creating the factor output stream, default [{DEFAULT_BUFFER_SIZE}]",
+    )
+    parser.add_argument(
+        "--frame-size",
+        type=int,
+        default=DEFAULT_FRAME_SIZE,
+        help=f"frame size used when creating the factor output stream, default [{DEFAULT_FRAME_SIZE}]",
     )
     args = parser.parse_args()
     if args.metrics_interval_sec <= 0:
         parser.error("--metrics-interval-sec must be positive")
-    if args.ring_capacity <= 0:
-        parser.error("--ring-capacity must be positive")
+    if args.buffer_size <= 0:
+        parser.error("--buffer-size must be positive")
+    if args.frame_size <= 0:
+        parser.error("--frame-size must be positive")
     try:
         args.id_filter = parse_id_filter(args.id_filter)
     except ValueError as error:
@@ -156,7 +165,8 @@ def _register_stream_if_needed(
     master: zippy.MasterClient,
     stream_name: str,
     schema: object,
-    ring_capacity: int,
+    buffer_size: int,
+    frame_size: int,
 ) -> None:
     """
     Ensure a master bus stream exists before a writer attaches to it.
@@ -167,13 +177,15 @@ def _register_stream_if_needed(
     :type stream_name: str
     :param schema: Expected stream schema.
     :type schema: object
-    :param ring_capacity: Ring capacity used when creating the stream.
-    :type ring_capacity: int
+    :param buffer_size: Buffer size used when creating the stream.
+    :type buffer_size: int
+    :param frame_size: Frame size used when creating the stream.
+    :type frame_size: int
     :raises RuntimeError: If stream creation fails for reasons other than an
         existing stream.
     """
     try:
-        master.register_stream(stream_name, schema, ring_capacity)
+        master.register_stream(stream_name, schema, buffer_size, frame_size)
     except RuntimeError as error:
         if "stream already exists" not in str(error):
             raise
@@ -195,7 +207,8 @@ def build_master(args: argparse.Namespace) -> zippy.MasterClient:
         master,
         args.output_stream_name,
         output_schema(),
-        args.ring_capacity,
+        args.buffer_size,
+        args.frame_size,
     )
     return master
 
@@ -309,7 +322,8 @@ if __name__ == "__main__":
         "master_config",
         "prepared master client "
         f"control_endpoint=[{Path(cli_args.control_endpoint).expanduser()}] source_stream=[{cli_args.source_stream_name}] "
-        f"output_stream=[{cli_args.output_stream_name}] ring_capacity=[{cli_args.ring_capacity}]",
+        f"output_stream=[{cli_args.output_stream_name}] buffer_size=[{cli_args.buffer_size}] "
+        f"frame_size=[{cli_args.frame_size}]",
     )
     source = build_source(cli_args, master)
     zippy.log_info(
