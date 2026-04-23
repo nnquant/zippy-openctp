@@ -35,6 +35,27 @@ pub struct RawTickSnapshot {
     pub ask_volume_1: i64,
 }
 
+impl RawTickSnapshot {
+    pub fn for_test(instrument_id: &str, last_price: f64) -> Self {
+        Self {
+            instrument_id: instrument_id.to_string(),
+            exchange_id: "SHFE".to_string(),
+            trading_day: "20260408".to_string(),
+            action_day: "20260408".to_string(),
+            update_time: "09:30:00".to_string(),
+            update_millisec: 500,
+            last_price,
+            volume: 1,
+            turnover: last_price * 10.0,
+            open_interest: 100.0,
+            bid_price_1: last_price - 0.5,
+            bid_volume_1: 5,
+            ask_price_1: last_price + 0.5,
+            ask_volume_1: 6,
+        }
+    }
+}
+
 /// Stable normalized tick row aligned with the fixed tick schema contract.
 ///
 /// :param instrument_id: Stable instrument identifier column value.
@@ -47,8 +68,14 @@ pub struct RawTickSnapshot {
 ///     requires this upstream field to be present in order to compose `dt_ns`, so
 ///     successful rows always carry `Some(action_day)`.
 /// :type action_day: Option[String]
-/// :param dt_ns: Event timestamp in UTC nanoseconds since Unix epoch.
+/// :param dt_ns: Event timestamp in Unix epoch nanoseconds since Unix epoch.
 /// :type dt_ns: i64
+/// :param localtime_ns: Local receive timestamp in Unix epoch nanoseconds. This is
+///     populated by the source layer, not by normalization.
+/// :type localtime_ns: i64
+/// :param source_emit_ns: Batch emit timestamp in Unix epoch nanoseconds. This is
+///     populated by the source layer when a batch is about to be emitted.
+/// :type source_emit_ns: i64
 #[derive(Debug, Clone, PartialEq)]
 pub struct NormalizedTickRow {
     pub instrument_id: String,
@@ -56,6 +83,8 @@ pub struct NormalizedTickRow {
     pub trading_day: Option<String>,
     pub action_day: Option<String>,
     pub dt_ns: i64,
+    pub localtime_ns: i64,
+    pub source_emit_ns: i64,
     pub last_price: Option<f64>,
     pub volume: Option<i64>,
     pub turnover: Option<f64>,
@@ -97,7 +126,8 @@ impl Error for NormalizeError {}
 /// :returns: Normalized row aligned with the fixed tick schema.
 /// :rtype: Result[NormalizedTickRow, NormalizeError]
 pub fn normalize_tick(raw: &RawTickSnapshot) -> Result<NormalizedTickRow, NormalizeError> {
-    let action_day = normalize_string(raw.action_day.as_str()).ok_or(NormalizeError::InvalidDate)?;
+    let action_day =
+        normalize_string(raw.action_day.as_str()).ok_or(NormalizeError::InvalidDate)?;
     let dt_ns = compose_exchange_timestamp_ns(
         action_day.as_str(),
         raw.update_time.as_str(),
@@ -110,6 +140,8 @@ pub fn normalize_tick(raw: &RawTickSnapshot) -> Result<NormalizedTickRow, Normal
         trading_day: normalize_string(raw.trading_day.as_str()),
         action_day: Some(action_day),
         dt_ns,
+        localtime_ns: 0,
+        source_emit_ns: 0,
         last_price: Some(raw.last_price),
         volume: Some(raw.volume),
         turnover: Some(raw.turnover),
