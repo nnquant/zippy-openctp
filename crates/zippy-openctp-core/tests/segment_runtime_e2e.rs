@@ -61,6 +61,31 @@ fn source_rejects_segment_ingress_with_buffered_batch_config() {
         .contains("segment ingress requires rows_per_batch=1 and flush_interval_ms=0"));
 }
 
+#[test]
+fn source_keeps_running_after_more_than_sixty_four_segment_rows() {
+    let sink = Arc::new(RecordingSink::default());
+    let (source, driver) = make_test_source_with_segment_ingress();
+    let segment_metrics = source.segment_debug_metrics_handle();
+    let handle = Box::new(source).start(sink.clone()).unwrap();
+
+    for index in 0..65 {
+        driver
+            .emit_trade_tick("rb2510", 4123.5 + index as f64)
+            .unwrap();
+    }
+    driver.emit_stop().unwrap();
+
+    handle.join().unwrap();
+
+    let metrics = segment_metrics.lock().unwrap().clone().unwrap();
+    let snapshot = metrics.active_snapshot.unwrap();
+    assert_eq!(metrics.committed_rows, 65);
+    assert_eq!(sink.data_rows().len(), 65);
+    assert!(sink.data_rows().iter().all(|rows| *rows == 1));
+    assert_eq!(snapshot.instrument_id.as_deref(), Some("rb2510"));
+    assert_eq!(snapshot.last_price, Some(4123.5 + 64.0));
+}
+
 fn make_test_source_with_segment_ingress() -> (OpenCtpMarketDataSource, FakeMdDriverHandle) {
     let (driver, handle) = FakeMdDriver::pair();
     let mut config = OpenCtpMarketDataSourceConfig::new(

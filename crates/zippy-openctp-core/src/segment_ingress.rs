@@ -1,6 +1,7 @@
 use arrow::array::{Float64Array, Int64Array, StringArray, TimestampNanosecondArray};
 use zippy_segment_store::{
-    compile_schema, ActiveSegmentWriter, ColumnSpec, ColumnType, LayoutPlan, RowSpanView,
+    compile_schema, ActiveSegmentWriter, ColumnSpec, ColumnType, CompiledSchema, LayoutPlan,
+    RowSpanView,
 };
 
 use crate::normalize::NormalizedTickRow;
@@ -22,7 +23,12 @@ pub struct OpenCtpSegmentDebugMetrics {
 }
 
 pub struct OpenCtpSegmentIngress {
+    schema: CompiledSchema,
+    layout: LayoutPlan,
     writer: ActiveSegmentWriter,
+    next_segment_id: u64,
+    generation: u64,
+    committed_rows: usize,
 }
 
 impl OpenCtpSegmentIngress {
@@ -43,11 +49,34 @@ impl OpenCtpSegmentIngress {
             ColumnSpec::new("last_price", ColumnType::Float64),
         ])?;
         let layout = LayoutPlan::for_schema(&schema, row_capacity)?;
-        let writer = ActiveSegmentWriter::new_for_test(schema, layout)?;
-        Ok(Self { writer })
+        let writer = ActiveSegmentWriter::new_for_runtime(schema.clone(), layout.clone(), 1, 0)?;
+        Ok(Self {
+            schema,
+            layout,
+            writer,
+            next_segment_id: 2,
+            generation: 0,
+            committed_rows: 0,
+        })
     }
 
     pub fn write_row(&mut self, row: &NormalizedTickRow) -> Result<(), &'static str> {
+        match self.try_write_row(row) {
+            Ok(()) => {
+                self.committed_rows += 1;
+                Ok(())
+            }
+            Err("segment is full") => {
+                self.rollover_writer()?;
+                self.try_write_row(row)?;
+                self.committed_rows += 1;
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn try_write_row(&mut self, row: &NormalizedTickRow) -> Result<(), &'static str> {
         let last_price = row.last_price.ok_or("last_price is required")?;
         self.writer.begin_row()?;
         self.writer.write_i64("dt", row.dt_ns)?;
@@ -60,11 +89,22 @@ impl OpenCtpSegmentIngress {
         self.writer.commit_row()
     }
 
+    fn rollover_writer(&mut self) -> Result<(), &'static str> {
+        self.writer = ActiveSegmentWriter::new_for_runtime(
+            self.schema.clone(),
+            self.layout.clone(),
+            self.next_segment_id,
+            self.generation,
+        )?;
+        self.next_segment_id += 1;
+        Ok(())
+    }
+
     pub fn active_snapshot(&self) -> Result<OpenCtpActiveSegmentSnapshot, &'static str> {
-        let committed_row_count = self.writer.committed_row_count();
-        if committed_row_count == 0 {
+        let writer_row_count = self.writer.committed_row_count();
+        if self.committed_rows == 0 {
             return Ok(OpenCtpActiveSegmentSnapshot {
-                committed_row_count,
+                committed_row_count: 0,
                 dt_ns: None,
                 localtime_ns: None,
                 source_emit_ns: None,
@@ -74,7 +114,7 @@ impl OpenCtpSegmentIngress {
         }
 
         let handle = self.writer.sealed_handle_for_test()?;
-        let batch = RowSpanView::new(handle, committed_row_count - 1, committed_row_count)
+        let batch = RowSpanView::new(handle, writer_row_count - 1, writer_row_count)
             .map_err(|_| "failed to build active segment row span")?
             .as_record_batch()
             .map_err(|_| "failed to export active segment snapshot")?;
@@ -100,7 +140,7 @@ impl OpenCtpSegmentIngress {
             .map(|array| array.value(0));
 
         Ok(OpenCtpActiveSegmentSnapshot {
-            committed_row_count,
+            committed_row_count: self.committed_rows,
             dt_ns,
             localtime_ns,
             source_emit_ns,
@@ -112,7 +152,7 @@ impl OpenCtpSegmentIngress {
     pub fn debug_metrics(&self) -> Result<OpenCtpSegmentDebugMetrics, &'static str> {
         let active_snapshot = self.active_snapshot()?;
         Ok(OpenCtpSegmentDebugMetrics {
-            committed_rows: self.writer.committed_row_count(),
+            committed_rows: self.committed_rows,
             active_snapshot: Some(active_snapshot),
         })
     }
