@@ -571,6 +571,7 @@ impl Source for OpenCtpMarketDataSource {
             driver,
         } = *self;
 
+        validate_segment_ingress_config(&config)?;
         let (tx, rx) = unbounded();
         set_status(&status, OpenCtpSourceStatus::Connecting);
         let driver_handle = match driver.start(tx) {
@@ -605,7 +606,7 @@ impl Source for OpenCtpMarketDataSource {
 
             let mut segment_ingress = if config.segment_ingress_enabled {
                 Some(
-                    OpenCtpSegmentIngress::for_test().map_err(|reason| ZippyError::Io {
+                    OpenCtpSegmentIngress::new_for_source().map_err(|reason| ZippyError::Io {
                         reason: reason.to_string(),
                     })?,
                 )
@@ -766,15 +767,20 @@ fn run_driver_event_loop(
                 let mut row =
                     normalize_tick(&raw).map_err(|error| map_source_error(error.into()))?;
                 row.localtime_ns = sample_localtime_ns().map_err(map_source_error)?;
-                if let Some(ingress) = segment_ingress.as_mut() {
-                    ingress
-                        .write_row(&row)
-                        .map_err(|reason| map_source_error(SourceError::Segment(reason)))?;
-                    *segment_debug_metrics.lock().unwrap() = Some(ingress.debug_metrics());
-                }
-                if let Some(batch) = emitter.push_tick(row).map_err(map_source_error)? {
+                if let Some(batch) = emitter.push_tick(row.clone()).map_err(map_source_error)? {
+                    let segment_row =
+                        segment_row_from_batch(&batch, &row).map_err(map_source_error)?;
                     record_batch_emission(metrics, &batch);
                     sink.emit(SourceEvent::Data(batch))?;
+                    if let Some(ingress) = segment_ingress.as_mut() {
+                        ingress
+                            .write_row(&segment_row)
+                            .map_err(|reason| map_source_error(SourceError::Segment(reason)))?;
+                        *segment_debug_metrics.lock().unwrap() =
+                            Some(ingress.debug_metrics().map_err(|reason| {
+                                map_source_error(SourceError::Segment(reason))
+                            })?);
+                    }
                 }
             }
             MdDriverEvent::SubscriptionOutcome(outcome) => {
@@ -901,6 +907,79 @@ fn map_source_error(error: SourceError) -> ZippyError {
     ZippyError::Io {
         reason: error.to_string(),
     }
+}
+
+fn validate_segment_ingress_config(config: &OpenCtpMarketDataSourceConfig) -> CoreResult<()> {
+    if config.segment_ingress_enabled
+        && (config.rows_per_batch != 1 || config.flush_interval_ms != 0)
+    {
+        return Err(ZippyError::InvalidConfig {
+            reason: "segment ingress requires rows_per_batch=1 and flush_interval_ms=0".to_string(),
+        });
+    }
+
+    Ok(())
+}
+
+fn segment_row_from_batch(
+    batch: &RecordBatch,
+    row: &NormalizedTickRow,
+) -> Result<NormalizedTickRow, SourceError> {
+    let mut segment_row = row.clone();
+    segment_row.dt_ns = batch_timestamp_ns_value(batch, "dt")?;
+    segment_row.localtime_ns = batch_i64_value(batch, "localtime_ns")?;
+    segment_row.source_emit_ns = batch_i64_value(batch, "source_emit_ns")?;
+    segment_row.instrument_id = batch_utf8_value(batch, "instrument_id")?;
+    segment_row.last_price = Some(batch_f64_value(batch, "last_price")?);
+    Ok(segment_row)
+}
+
+fn batch_timestamp_ns_value(batch: &RecordBatch, column_name: &str) -> Result<i64, SourceError> {
+    batch
+        .column_by_name(column_name)
+        .and_then(|column| column.as_any().downcast_ref::<TimestampNanosecondArray>())
+        .map(|array| array.value(0))
+        .ok_or_else(|| {
+            SourceError::Arrow(arrow::error::ArrowError::SchemaError(format!(
+                "missing timestamp(ns) column [{column_name}]"
+            )))
+        })
+}
+
+fn batch_i64_value(batch: &RecordBatch, column_name: &str) -> Result<i64, SourceError> {
+    batch
+        .column_by_name(column_name)
+        .and_then(|column| column.as_any().downcast_ref::<Int64Array>())
+        .map(|array| array.value(0))
+        .ok_or_else(|| {
+            SourceError::Arrow(arrow::error::ArrowError::SchemaError(format!(
+                "missing Int64 column [{column_name}]"
+            )))
+        })
+}
+
+fn batch_utf8_value(batch: &RecordBatch, column_name: &str) -> Result<String, SourceError> {
+    batch
+        .column_by_name(column_name)
+        .and_then(|column| column.as_any().downcast_ref::<StringArray>())
+        .map(|array| array.value(0).to_string())
+        .ok_or_else(|| {
+            SourceError::Arrow(arrow::error::ArrowError::SchemaError(format!(
+                "missing Utf8 column [{column_name}]"
+            )))
+        })
+}
+
+fn batch_f64_value(batch: &RecordBatch, column_name: &str) -> Result<f64, SourceError> {
+    batch
+        .column_by_name(column_name)
+        .and_then(|column| column.as_any().downcast_ref::<Float64Array>())
+        .map(|array| array.value(0))
+        .ok_or_else(|| {
+            SourceError::Arrow(arrow::error::ArrowError::SchemaError(format!(
+                "missing Float64 column [{column_name}]"
+            )))
+        })
 }
 
 fn join_driver_handle(join_handle: JoinHandle<CoreResult<()>>) -> CoreResult<()> {

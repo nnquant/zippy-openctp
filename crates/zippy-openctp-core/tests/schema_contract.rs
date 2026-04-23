@@ -15,6 +15,8 @@ fn tick_data_schema_contains_required_columns_in_stable_order() {
             "trading_day",
             "action_day",
             "dt",
+            "localtime_ns",
+            "source_emit_ns",
             "last_price",
             "volume",
             "turnover",
@@ -31,10 +33,21 @@ fn tick_data_schema_contains_required_columns_in_stable_order() {
         dt.data_type(),
         &arrow::datatypes::DataType::Timestamp(
             arrow::datatypes::TimeUnit::Nanosecond,
-            Some("UTC".into())
+            Some("Asia/Shanghai".into())
         )
     );
     assert!(!dt.is_nullable());
+
+    let localtime_ns = schema.field_with_name("localtime_ns").unwrap();
+    assert_eq!(localtime_ns.data_type(), &arrow::datatypes::DataType::Int64);
+    assert!(!localtime_ns.is_nullable());
+
+    let source_emit_ns = schema.field_with_name("source_emit_ns").unwrap();
+    assert_eq!(
+        source_emit_ns.data_type(),
+        &arrow::datatypes::DataType::Int64
+    );
+    assert!(!source_emit_ns.is_nullable());
 
     let instrument_id = schema.field_with_name("instrument_id").unwrap();
     assert_eq!(instrument_id.data_type(), &arrow::datatypes::DataType::Utf8);

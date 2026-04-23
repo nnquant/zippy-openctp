@@ -5,7 +5,7 @@ use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TickSchemaType {
     Utf8,
-    TimestampNsUtc,
+    TimestampNsShanghai,
     Float64,
     Int64,
 }
@@ -40,7 +40,17 @@ pub const TICK_SCHEMA_FIELDS: &[TickSchemaField] = &[
     },
     TickSchemaField {
         name: "dt",
-        data_type: TickSchemaType::TimestampNsUtc,
+        data_type: TickSchemaType::TimestampNsShanghai,
+        nullable: false,
+    },
+    TickSchemaField {
+        name: "localtime_ns",
+        data_type: TickSchemaType::Int64,
+        nullable: false,
+    },
+    TickSchemaField {
+        name: "source_emit_ns",
+        data_type: TickSchemaType::Int64,
         nullable: false,
     },
     TickSchemaField {
@@ -94,8 +104,8 @@ pub fn tick_data_schema() -> Arc<Schema> {
                     field.name,
                     match field.data_type {
                         TickSchemaType::Utf8 => DataType::Utf8,
-                        TickSchemaType::TimestampNsUtc => {
-                            DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()))
+                        TickSchemaType::TimestampNsShanghai => {
+                            DataType::Timestamp(TimeUnit::Nanosecond, Some("Asia/Shanghai".into()))
                         }
                         TickSchemaType::Float64 => DataType::Float64,
                         TickSchemaType::Int64 => DataType::Int64,

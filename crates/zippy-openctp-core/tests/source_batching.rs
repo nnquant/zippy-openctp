@@ -1,6 +1,7 @@
 use std::time::{Duration, Instant};
 
-use arrow::array::StringArray;
+use arrow::array::{Int64Array, StringArray, TimestampNanosecondArray};
+use arrow::datatypes::{DataType, TimeUnit};
 use zippy_openctp_core::source::{FakeOpenCtpSourceRuntime, SourceError};
 use zippy_openctp_core::OpenCtpMarketDataSourceConfig;
 
@@ -17,6 +18,13 @@ fn batching_flushes_immediately_when_rows_per_batch_is_one() {
     let batch = batch.expect("rows_per_batch=1 should flush immediately");
     assert_eq!(batch.num_rows(), 1);
     assert_eq!(instrument_ids(&batch), vec!["IF2506"]);
+    assert_eq!(
+        batch.schema().field_with_name("dt").unwrap().data_type(),
+        &DataType::Timestamp(TimeUnit::Nanosecond, Some("Asia/Shanghai".into()))
+    );
+    assert_eq!(dt_values(&batch), vec![1_775_611_800_500_000_000]);
+    assert!(localtime_ns_values(&batch)[0] > 0);
+    assert!(source_emit_ns_values(&batch)[0] >= localtime_ns_values(&batch)[0]);
 }
 
 #[test]
@@ -98,5 +106,42 @@ fn instrument_ids(batch: &arrow::record_batch::RecordBatch) -> Vec<&str> {
         .downcast_ref::<StringArray>()
         .expect("instrument_id must be Utf8");
 
-    array.iter().map(|value| value.expect("non-null instrument_id")).collect()
+    array
+        .iter()
+        .map(|value| value.expect("non-null instrument_id"))
+        .collect()
+}
+
+fn dt_values(batch: &arrow::record_batch::RecordBatch) -> Vec<i64> {
+    let column = batch.column_by_name("dt").expect("dt column must exist");
+    let array = column
+        .as_any()
+        .downcast_ref::<TimestampNanosecondArray>()
+        .expect("dt must be timestamp(ns)");
+
+    (0..array.len()).map(|index| array.value(index)).collect()
+}
+
+fn localtime_ns_values(batch: &arrow::record_batch::RecordBatch) -> Vec<i64> {
+    let column = batch
+        .column_by_name("localtime_ns")
+        .expect("localtime_ns column must exist");
+    let array = column
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("localtime_ns must be Int64");
+
+    (0..array.len()).map(|index| array.value(index)).collect()
+}
+
+fn source_emit_ns_values(batch: &arrow::record_batch::RecordBatch) -> Vec<i64> {
+    let column = batch
+        .column_by_name("source_emit_ns")
+        .expect("source_emit_ns column must exist");
+    let array = column
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("source_emit_ns must be Int64");
+
+    (0..array.len()).map(|index| array.value(index)).collect()
 }
