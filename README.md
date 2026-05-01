@@ -78,6 +78,26 @@ zippy.setup_log(
 
 `OpenCtpMarketDataSource(...)` 只会构造 source 对象；不会在 import 或构造阶段立刻发起真实连接。
 真实 OpenCTP 登录、订阅与收流会在关联的 engine 执行 `start()` 后发生。
+插件会在 source 内部管理 segment 写入、active descriptor 和 reader attach，`StreamTableEngine`
+仍然直接消费这个 source，不需要用户手写 `SegmentStreamSource` 或 segment writer 生命周期代码。
+
+## Market Generator Source
+
+非开盘时段可以用 native generator source 生成 CTP md schema 兼容 tick，用于系统测试和性能测试：
+
+```python
+source = zippy_openctp.OpenCtpMarketGeneratorSource(
+    instruments=["IF2606", "IH2606"],
+    interval_ms=10,
+    seed=42,
+    max_ticks=100_000,
+)
+```
+
+`interval_ms` 表示每隔 `T` ms 生成一轮完整行情；每轮会按配置顺序为所有 instrument 各生成
+一条 tick。因此理论输入速率约为 `len(instruments) * 1000 / interval_ms` ticks/s。generator
+复用真实 OpenCTP source 的 normalize、segment ingress、descriptor publisher 和 zippy source 生命周期，
+下游 `StreamTableEngine`、`TimeSeriesEngine`、`ReactiveStateEngine` 不需要改代码。
 
 ## Live Source 手工验证
 
@@ -261,7 +281,10 @@ The current stage provides:
 
 - an independent git repository
 - a fixed tick schema contract via `zippy_openctp.schemas.TickDataSchema()`
+- `dt` as event time in `timestamp(ns, Asia/Shanghai)`
+- `localtime_ns` as local receive time in Unix epoch nanoseconds
 - a Python-facing `OpenCtpMarketDataSource` with stable config, status, and metrics accessors
+- a segment-primary source path that hides segment writer/reader lifecycle behind the source plugin
 - Rust core modules for live source lifecycle, normalization, and metrics
 - minimal examples for local Parquet, remote ZMQ pipelines, and remote factor computation
 - documented manual verification steps for live OpenCTP connectivity

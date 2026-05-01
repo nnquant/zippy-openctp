@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 import time
 
+from _runtime_lease import ExampleRuntimeLoopState, advance_runtime_loop
 import pyarrow as pa
 
 import zippy
@@ -115,18 +116,19 @@ def factor_schema() -> pa.Schema:
 
 def build_source(
     args: argparse.Namespace,
-    master: zippy.MasterClient,
+    master: zippy.MasterClient | None = None,
 ) -> zippy.BusStreamSource:
     """
     Build the factor bus stream source.
 
     :param args: Parsed command-line arguments.
     :type args: argparse.Namespace
-    :param master: Registered master client.
-    :type master: zippy.MasterClient
+    :param master: Registered master client. When omitted, ``zippy.connect()`` is used.
+    :type master: zippy.MasterClient | None
     :returns: Configured factor source.
     :rtype: zippy.BusStreamSource
     """
+    master = master or zippy.master()
     return zippy.BusStreamSource(
         stream_name=args.source_stream_name,
         expected_schema=factor_schema(),
@@ -197,15 +199,17 @@ if __name__ == "__main__":
         f"initialized zippy logging log_snapshot=[{log_snapshot}]",
     )
     control_endpoint = str(Path(cli_args.control_endpoint).expanduser())
-    master = zippy.MasterClient(control_endpoint=control_endpoint)
-    master.register_process("openctp_mid_price_factor_subscriber")
+    master = zippy.connect(
+        uri=control_endpoint,
+        app="openctp_mid_price_factor_subscriber",
+    )
     zippy.log_info(
         "openctp_factor_subscriber",
         "master_config",
-        "prepared master client "
+        "initialized master client "
         f"control_endpoint=[{control_endpoint}] source_stream=[{cli_args.source_stream_name}]",
     )
-    source = build_source(cli_args, master)
+    source = build_source(cli_args)
     zippy.log_info(
         "openctp_factor_subscriber",
         "source_config",
@@ -218,7 +222,7 @@ if __name__ == "__main__":
         "pipeline_schema",
         f"built subscriber pipeline output_schema=[{engine.output_schema()}]",
     )
-    reader = master.read_from(cli_args.source_stream_name)
+    reader = zippy.read_from(cli_args.source_stream_name)
     zippy.log_info(
         "openctp_factor_subscriber",
         "start",
@@ -227,12 +231,19 @@ if __name__ == "__main__":
     )
     engine.start()
 
-    next_metrics_at = time.monotonic() + cli_args.metrics_interval_sec
+    loop_state = ExampleRuntimeLoopState.initial(
+        start_monotonic=time.monotonic(),
+        metrics_interval_sec=cli_args.metrics_interval_sec,
+    )
 
     try:
         while True:
+            poll_timeout_ms = min(
+                cli_args.recv_timeout_ms,
+                int(loop_state.heartbeat_interval_sec * 1000),
+            )
             try:
-                batch = reader.read(timeout_ms=cli_args.recv_timeout_ms)
+                batch = reader.read(timeout_ms=poll_timeout_ms)
             except RuntimeError as error:
                 if "reader timed out" in str(error):
                     batch = None
@@ -252,15 +263,20 @@ if __name__ == "__main__":
                     status=engine.status(),
                 )
 
-            now = time.monotonic()
-            if now >= next_metrics_at:
+            loop_tick = advance_runtime_loop(
+                state=loop_state,
+                now_monotonic=time.monotonic(),
+            )
+            loop_state = loop_tick.state
+            if loop_tick.send_heartbeat:
+                master.heartbeat()
+            if loop_tick.send_metrics:
                 zippy.log_info(
                     "openctp_factor_subscriber",
                     "engine_heartbeat",
                     f"engine metrics heartbeat metrics=[{engine.metrics()}]",
                     status=engine.status(),
                 )
-                next_metrics_at = now + cli_args.metrics_interval_sec
     except KeyboardInterrupt:
         zippy.log_info(
             "openctp_factor_subscriber",

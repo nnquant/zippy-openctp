@@ -14,8 +14,6 @@ fn source_config_defaults_to_single_tick_publish() {
     assert_eq!(config.password, "secret");
     assert!(config.reconnect);
     assert_eq!(config.login_timeout_sec, 10);
-    assert_eq!(config.rows_per_batch, 1);
-    assert_eq!(config.flush_interval_ms, 0);
 }
 
 #[test]

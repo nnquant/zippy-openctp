@@ -7,8 +7,8 @@ use zippy_openctp_core::source::{
     evaluate_subscription_results, MdDriverEvent, MdDriverHandle, SubscriptionOutcome,
 };
 use zippy_openctp_core::{
-    MdDriver, OpenCtpMarketDataSource, OpenCtpMarketDataSourceConfig, OpenCtpSourceStatus,
-    OpenCtpSourceMetrics,
+    MdDriver, OpenCtpMarketDataSource, OpenCtpMarketDataSourceConfig, OpenCtpSourceMetrics,
+    OpenCtpSourceStatus,
 };
 
 #[test]
@@ -122,7 +122,8 @@ impl MdDriver for FakeMdDriver {
     fn start(self: Box<Self>, tx: Sender<MdDriverEvent>) -> CoreResult<MdDriverHandle> {
         let join_handle = thread::spawn(move || -> CoreResult<()> {
             for event in self.events {
-                tx.send(event).map_err(|_| zippy_core::ZippyError::ChannelSend)?;
+                tx.send(event)
+                    .map_err(|_| zippy_core::ZippyError::ChannelSend)?;
             }
             Ok(())
         });

@@ -1,4 +1,7 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -69,7 +72,8 @@ impl MdDriver for FakeMdDriver {
                 if matches!(event, MdDriverEvent::Stop) {
                     thread::sleep(self.delay_before_stop);
                 }
-                tx.send(event).map_err(|_| zippy_core::ZippyError::ChannelSend)?;
+                tx.send(event)
+                    .map_err(|_| zippy_core::ZippyError::ChannelSend)?;
             }
             Ok(())
         });
@@ -114,10 +118,30 @@ fn fake_md_driver_emits_data_and_stop_events() {
     );
 }
 
-fn wait_for_status(
-    status: &Arc<Mutex<OpenCtpSourceStatus>>,
-    expected: OpenCtpSourceStatus,
-) {
+#[test]
+fn source_requests_driver_stop_before_joining_after_sink_failure() {
+    let stop_called = Arc::new(AtomicBool::new(false));
+    let sink = Arc::new(FailingDataSink::default());
+    let source = OpenCtpMarketDataSource::from_driver(
+        default_source_config(),
+        Box::new(StopAwareTickDriver {
+            stop_called: stop_called.clone(),
+        }),
+    );
+    let status = source.status_handle();
+
+    let handle = Box::new(source)
+        .start(sink)
+        .expect("source start should succeed");
+
+    let err = handle.join().unwrap_err();
+
+    assert!(err.to_string().contains("forced sink failure"));
+    assert!(stop_called.load(Ordering::SeqCst));
+    assert_eq!(*status.lock().unwrap(), OpenCtpSourceStatus::Failed);
+}
+
+fn wait_for_status(status: &Arc<Mutex<OpenCtpSourceStatus>>, expected: OpenCtpSourceStatus) {
     let deadline = Instant::now() + Duration::from_secs(1);
     loop {
         if *status.lock().unwrap() == expected {
@@ -129,6 +153,69 @@ fn wait_for_status(
         }
 
         thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[derive(Default)]
+struct FailingDataSink {
+    events: Mutex<Vec<RecordedEvent>>,
+}
+
+impl SourceSink for FailingDataSink {
+    fn emit(&self, event: SourceEvent) -> CoreResult<()> {
+        let recorded = match event {
+            SourceEvent::Hello(hello) => RecordedEvent::Hello {
+                stream_name: hello.stream_name,
+            },
+            SourceEvent::Data(batch) => {
+                let recorded = RecordedEvent::Data {
+                    rows: batch.num_rows(),
+                };
+                self.events.lock().unwrap().push(recorded);
+                return Err(zippy_core::ZippyError::Io {
+                    reason: "forced sink failure".to_string(),
+                });
+            }
+            SourceEvent::Flush => RecordedEvent::Flush,
+            SourceEvent::Stop => RecordedEvent::Stop,
+            SourceEvent::Error(reason) => RecordedEvent::Error { reason },
+        };
+        self.events.lock().unwrap().push(recorded);
+        Ok(())
+    }
+}
+
+struct StopAwareTickDriver {
+    stop_called: Arc<AtomicBool>,
+}
+
+impl MdDriver for StopAwareTickDriver {
+    fn start(self: Box<Self>, tx: Sender<MdDriverEvent>) -> CoreResult<MdDriverHandle> {
+        let stop_called_for_thread = self.stop_called.clone();
+        let join_handle = thread::spawn(move || -> CoreResult<()> {
+            tx.send(MdDriverEvent::Tick(sample_tick("IF2506", 1)))
+                .map_err(|_| zippy_core::ZippyError::ChannelSend)?;
+
+            let deadline = Instant::now() + Duration::from_millis(500);
+            while Instant::now() < deadline {
+                if stop_called_for_thread.load(Ordering::SeqCst) {
+                    return Ok(());
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+
+            Err(zippy_core::ZippyError::Io {
+                reason: "driver stop was not requested".to_string(),
+            })
+        });
+        let stop_called_for_stop = self.stop_called.clone();
+        Ok(MdDriverHandle::new_with_stop(
+            join_handle,
+            Box::new(move || {
+                stop_called_for_stop.store(true, Ordering::SeqCst);
+                Ok(())
+            }),
+        ))
     }
 }
 

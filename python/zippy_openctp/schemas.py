@@ -8,7 +8,7 @@ def TickDataSchema():
 
     type_mapping = {
         "utf8": pa.string(),
-        "timestamp_ns_utc": pa.timestamp("ns", tz="UTC"),
+        "timestamp_ns_shanghai": pa.timestamp("ns", tz="Asia/Shanghai"),
         "float64": pa.float64(),
         "int64": pa.int64(),
     }

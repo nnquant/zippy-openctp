@@ -12,5 +12,8 @@ arrow = "53.3.0"
 crossbeam-channel = "0.5.15"
 tracing = "0.1.41"
 zippy-core = { path = "../../../../crates/zippy-core" }
-zippy-segment-store = { path = "../../../../.worktrees/segment-store-hot-table/crates/zippy-segment-store" }
+zippy-segment-store = { path = "../../../../crates/zippy-segment-store" }
 ctp2rs = { version = "0.1", default-features = false, features = ["v1alpha1", "ctp_v6_7_11", "openctp"] }
+
+[dev-dependencies]
+zippy-operator-runtime = { path = "../../../../crates/zippy-operator-runtime" }

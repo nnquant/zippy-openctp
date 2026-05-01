@@ -7,9 +7,12 @@ zippy-master bus for downstream consumers.
 """
 
 import argparse
+from collections.abc import Callable
+import json
 from pathlib import Path
 import time
 
+from _runtime_lease import ExampleRuntimeLoopState, advance_runtime_loop
 import zippy
 import zippy_openctp
 
@@ -17,6 +20,7 @@ DEFAULT_INSTRUMENTS = "IF2606"
 DEFAULT_FLOW_PATH = ".cache/openctp/md"
 DEFAULT_CONTROL_ENDPOINT = "~/.zippy/master.sock"
 DEFAULT_STREAM_NAME = "openctp_ticks"
+DEFAULT_SOURCE_NAME = "openctp_md"
 DEFAULT_OUTPUT_PATH = "data/openctp_ticks"
 DEFAULT_LOG_DIR = "logs"
 DEFAULT_LOG_LEVEL = "info"
@@ -64,18 +68,6 @@ def parse_args() -> argparse.Namespace:
         "--flow-path",
         default=DEFAULT_FLOW_PATH,
         help=f"OpenCTP flow path, default [{DEFAULT_FLOW_PATH}]",
-    )
-    parser.add_argument(
-        "--rows-per-batch",
-        type=int,
-        default=1,
-        help="ticks per emitted batch, default [1]",
-    )
-    parser.add_argument(
-        "--flush-interval-ms",
-        type=int,
-        default=0,
-        help="max batch flush interval in milliseconds, default [0]",
     )
     parser.add_argument(
         "--control-endpoint",
@@ -140,15 +132,56 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def build_source(args: argparse.Namespace) -> zippy_openctp.OpenCtpMarketDataSource:
+def build_segment_descriptor_publisher(
+    master: zippy.MasterClient,
+    stream_name: str,
+) -> Callable[[bytes], None]:
+    """
+    Build a callback that publishes active segment metadata through master.
+
+    :param master: Registered master client for the OpenCTP source process.
+    :type master: zippy.MasterClient
+    :param stream_name: Stream whose active segment descriptor should be updated.
+    :type stream_name: str
+    :returns: Callback accepted by ``OpenCtpMarketDataSource``.
+    :rtype: Callable[[bytes], None]
+    """
+
+    def publish_segment_descriptor(descriptor_envelope: bytes) -> None:
+        descriptor = json.loads(descriptor_envelope.decode("utf-8"))
+        master.publish_segment_descriptor(stream_name, descriptor)
+        zippy.log_info(
+            "openctp_example",
+            "segment_descriptor",
+            f"published active segment descriptor stream_name=[{stream_name}] "
+            f"segment_id=[{descriptor.get('segment_id')}] generation=[{descriptor.get('generation')}]",
+        )
+
+    return publish_segment_descriptor
+
+
+def build_source(
+    args: argparse.Namespace,
+    master: zippy.MasterClient | None = None,
+) -> zippy_openctp.OpenCtpMarketDataSource:
     """
     Build a live-capable OpenCTP market data source from command-line arguments.
 
     :param args: Parsed command-line arguments.
     :type args: argparse.Namespace
+    :param master: Optional master client used to publish segment descriptors in
+        segment mode.
+    :type master: zippy.MasterClient | None
     :returns: Configured OpenCTP market data source.
     :rtype: zippy_openctp.OpenCtpMarketDataSource
     """
+    segment_descriptor_publisher = None
+    if master is not None:
+        segment_descriptor_publisher = build_segment_descriptor_publisher(
+            master,
+            args.stream_name,
+        )
+
     return zippy_openctp.OpenCtpMarketDataSource(
         front=args.front,
         broker_id=args.broker_id,
@@ -156,8 +189,7 @@ def build_source(args: argparse.Namespace) -> zippy_openctp.OpenCtpMarketDataSou
         password=args.password,
         instruments=_parse_instruments(args.instruments),
         flow_path=args.flow_path,
-        rows_per_batch=args.rows_per_batch,
-        flush_interval_ms=args.flush_interval_ms,
+        segment_descriptor_publisher=segment_descriptor_publisher,
     )
 
 
@@ -191,6 +223,41 @@ def _register_stream_if_needed(
             raise
 
 
+def _register_source_if_needed(
+    master: zippy.MasterClient,
+    args: argparse.Namespace,
+) -> None:
+    """
+    Ensure the OpenCTP source owns the stream in master control-plane metadata.
+
+    :param master: Master client used for control-plane registration.
+    :type master: zippy.MasterClient
+    :param args: Parsed command-line arguments.
+    :type args: argparse.Namespace
+    :raises RuntimeError: If source creation fails for reasons other than an
+        existing source.
+    """
+    source_config = {
+        "broker_id": args.broker_id,
+        "data_path": "segment",
+        "flow_path": args.flow_path,
+        "front": args.front,
+        "instruments": _parse_instruments(args.instruments),
+        "password": "***redacted***",
+        "user_id": args.user_id,
+    }
+    try:
+        master.register_source(
+            DEFAULT_SOURCE_NAME,
+            "openctp",
+            args.stream_name,
+            source_config,
+        )
+    except RuntimeError as error:
+        if "source already exists" not in str(error):
+            raise
+
+
 def build_master(
     args: argparse.Namespace,
 ) -> tuple[zippy.MasterClient, zippy.MasterServer | None]:
@@ -218,6 +285,7 @@ def build_master(
         args.buffer_size,
         args.frame_size,
     )
+    _register_source_if_needed(master, args)
     return master, server
 
 
@@ -260,7 +328,7 @@ def build_pipeline(
     :returns: Configured stream-table engine ready to be started by the caller.
     :rtype: zippy.StreamTableEngine
     """
-    source = source or build_source(args)
+    source = source or build_source(args, master)
     if target is None:
         if master is None:
             raise RuntimeError("master is required when target is not provided")
@@ -300,7 +368,7 @@ if __name__ == "__main__":
         f"buffer_size=[{cli_args.buffer_size}] frame_size=[{cli_args.frame_size}] "
         f"start_master=[{cli_args.start_master}]",
     )
-    source = build_source(cli_args)
+    source = build_source(cli_args, master)
     zippy.log_info("openctp_example", "source_config", f"built openctp source source_config=[{source.config()}]")
     zippy.log_info(
         "openctp_example",
@@ -323,21 +391,33 @@ if __name__ == "__main__":
     )
     zippy.log_info("openctp_example", "start", "starting live stream-table remote pipeline")
     engine.start()
+    loop_state = ExampleRuntimeLoopState.initial(
+        start_monotonic=time.monotonic(),
+        metrics_interval_sec=cli_args.metrics_interval_sec,
+    )
     try:
         while True:
-            zippy.log_info(
-                "openctp_example",
-                "source_heartbeat",
-                f"source metrics heartbeat metrics=[{source.metrics()}]",
-                status=source.status(),
+            loop_tick = advance_runtime_loop(
+                state=loop_state,
+                now_monotonic=time.monotonic(),
             )
-            zippy.log_info(
-                "openctp_example",
-                "engine_heartbeat",
-                f"engine metrics heartbeat metrics=[{engine.metrics()}]",
-                status=engine.status(),
-            )
-            time.sleep(cli_args.metrics_interval_sec)
+            loop_state = loop_tick.state
+            if loop_tick.send_heartbeat:
+                master.heartbeat()
+            if loop_tick.send_metrics:
+                zippy.log_info(
+                    "openctp_example",
+                    "source_heartbeat",
+                    f"source metrics heartbeat metrics=[{source.metrics()}]",
+                    status=source.status(),
+                )
+                zippy.log_info(
+                    "openctp_example",
+                    "engine_heartbeat",
+                    f"engine metrics heartbeat metrics=[{engine.metrics()}]",
+                    status=engine.status(),
+                )
+            time.sleep(loop_tick.sleep_sec)
     except KeyboardInterrupt:
         zippy.log_info(
             "openctp_example",

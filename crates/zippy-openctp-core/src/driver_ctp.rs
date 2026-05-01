@@ -1,6 +1,8 @@
 use std::collections::HashSet;
 use std::env;
+use std::ffi::CString;
 use std::fs;
+use std::os::raw::c_char;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -45,6 +47,42 @@ fn openctp_debug_log(message: &str) {
             message = message,
             "{message}"
         );
+    }
+}
+
+struct SubscriptionRequestBuffer {
+    _cstrings: Vec<CString>,
+    ptrs: Vec<*mut c_char>,
+}
+
+impl SubscriptionRequestBuffer {
+    fn new(instruments: &[String]) -> CoreResult<Self> {
+        let cstrings = instruments
+            .iter()
+            .map(|instrument| {
+                CString::new(instrument.as_str()).map_err(|error| ZippyError::Io {
+                    reason: format!(
+                        "failed to encode instrument for subscribe instrument=[{instrument}] error=[{error}]"
+                    ),
+                })
+            })
+            .collect::<CoreResult<Vec<_>>>()?;
+        let ptrs = cstrings
+            .iter()
+            .map(|instrument| instrument.as_ptr() as *mut c_char)
+            .collect::<Vec<_>>();
+        Ok(Self {
+            _cstrings: cstrings,
+            ptrs,
+        })
+    }
+
+    unsafe fn subscribe_market_data(&self, api: &MdApi) -> i32 {
+        ((*(*api.api_ptr).vtable_).CThostFtdcMdApi_SubscribeMarketData)(
+            api.api_ptr,
+            self.ptrs.as_ptr() as *mut *mut c_char,
+            self.ptrs.len() as i32,
+        )
     }
 }
 
@@ -157,9 +195,9 @@ impl MdDriver for Ctp2rsMdDriver {
             loop_result
         });
 
-            let stop_fn = {
-                let stop_tx = stop_tx.clone();
-                let stop_stopping = stopping.clone();
+        let stop_fn = {
+            let stop_tx = stop_tx.clone();
+            let stop_stopping = stopping.clone();
 
             Box::new(move || -> CoreResult<()> {
                 openctp_debug_log("driver stop_fn invoked");
@@ -309,7 +347,10 @@ impl MdSpi for LiveMdSpi {
         let raw = match raw_tick_from_depth_market_data(depth_market_data) {
             Ok(raw) => raw,
             Err(error) => {
-                openctp_debug_log(&format!("spi on_rtn_depth_market_data decode_error=[{}]", error));
+                openctp_debug_log(&format!(
+                    "spi on_rtn_depth_market_data decode_error=[{}]",
+                    error
+                ));
                 error!(
                     component = "openctp_source",
                     event = "tick_decode_error",
@@ -413,6 +454,7 @@ fn run_live_driver_loop(
         message = "market data driver loop started"
     );
     let mut pending_subscription = PendingSubscription::new(config.instruments.as_slice());
+    let mut _active_subscription_buffer: Option<SubscriptionRequestBuffer> = None;
     let mut reconnect_state =
         ReconnectState::new(std::time::Duration::from_secs(RECONNECT_INTERVAL_SECS));
 
@@ -497,13 +539,16 @@ fn run_live_driver_loop(
                     Ok(LiveMdControlEvent::UserLoginSucceeded) => {
                         openctp_debug_log("driver event UserLoginSucceeded");
                         pending_subscription.reset();
+                        let request_buffer =
+                            SubscriptionRequestBuffer::new(config.instruments.as_slice())?;
                         let subscribe_result = {
                             let guard = api_holder.lock().unwrap();
                             let api = guard.as_ref().ok_or_else(|| ZippyError::Io {
                                 reason: "ctp md api not available after login".to_string(),
                             })?;
-                            api.subscribe_market_data(config.instruments.as_slice())
+                            unsafe { request_buffer.subscribe_market_data(api) }
                         };
+                        _active_subscription_buffer = Some(request_buffer);
                         openctp_debug_log(&format!(
                             "driver subscribe_market_data instruments=[{}] result=[{subscribe_result}]",
                             config.instruments.join(",")
@@ -517,7 +562,8 @@ fn run_live_driver_loop(
                         );
 
                         if subscribe_result != 0 {
-                            let reason = format!("ctp md subscribe_market_data failed code=[{subscribe_result}]");
+                            let reason =
+                                format!("ctp md subscribe_market_data failed code=[{subscribe_result}]");
                             error!(
                                 component = "openctp_source",
                                 event = "subscribe_request_failure",
@@ -554,6 +600,7 @@ fn run_live_driver_loop(
                         pending_subscription.observe(request_id, instrument_id, succeeded);
                         if is_last {
                             if let Some(outcome) = pending_subscription.finish_and_reset(request_id) {
+                                _active_subscription_buffer = None;
                                 if reconnect_state.status() == crate::source::OpenCtpSourceStatus::Degraded {
                                     reconnect_state.mark_reconnected();
                                     tx.send(MdDriverEvent::ReconnectUpdate(crate::source::ReconnectUpdate {
@@ -597,8 +644,7 @@ struct ReconnectGate {
     sleep_for: std::time::Duration,
 }
 
-impl ReconnectGate {
-}
+impl ReconnectGate {}
 
 fn reconnect_gate_for_front_connected(
     reconnect_state: &ReconnectState,
@@ -787,11 +833,9 @@ mod tests {
         let mut reconnect_state = ReconnectState::new(Duration::from_secs(3));
         reconnect_state.mark_disconnected_at(start);
 
-        let reconnect_gate = reconnect_gate_for_front_connected(
-            &reconnect_state,
-            start + Duration::from_secs(1),
-        )
-        .expect("degraded source should produce reconnect gate");
+        let reconnect_gate =
+            reconnect_gate_for_front_connected(&reconnect_state, start + Duration::from_secs(1))
+                .expect("degraded source should produce reconnect gate");
 
         assert_eq!(reconnect_gate.sleep_for, Duration::from_secs(2));
         assert_eq!(reconnect_state.reconnects_total(), 0);

@@ -10,6 +10,7 @@ import argparse
 from pathlib import Path
 import time
 
+from _runtime_lease import ExampleRuntimeLoopState, advance_runtime_loop
 import zippy
 import zippy_openctp
 
@@ -201,8 +202,7 @@ def build_master(args: argparse.Namespace) -> zippy.MasterClient:
     :rtype: zippy.MasterClient
     """
     control_endpoint = str(Path(args.control_endpoint).expanduser())
-    master = zippy.MasterClient(control_endpoint=control_endpoint)
-    master.register_process("openctp_mid_price_factor")
+    master = zippy.connect(uri=control_endpoint, app="openctp_mid_price_factor")
     _register_stream_if_needed(
         master,
         args.output_stream_name,
@@ -215,18 +215,19 @@ def build_master(args: argparse.Namespace) -> zippy.MasterClient:
 
 def build_source(
     args: argparse.Namespace,
-    master: zippy.MasterClient,
+    master: zippy.MasterClient | None = None,
 ) -> zippy.BusStreamSource:
     """
     Build the bus-backed tick source.
 
     :param args: Parsed command-line arguments.
     :type args: argparse.Namespace
-    :param master: Registered master client.
-    :type master: zippy.MasterClient
+    :param master: Registered master client. When omitted, ``zippy.connect()`` is used.
+    :type master: zippy.MasterClient | None
     :returns: Configured bus source.
     :rtype: zippy.BusStreamSource
     """
+    master = master or zippy.master()
     return zippy.BusStreamSource(
         stream_name=args.source_stream_name,
         expected_schema=zippy_openctp.schemas.TickDataSchema(),
@@ -237,18 +238,19 @@ def build_source(
 
 def build_target(
     args: argparse.Namespace,
-    master: zippy.MasterClient,
+    master: zippy.MasterClient | None = None,
 ) -> zippy.BusStreamTarget:
     """
     Build the factor output bus target.
 
     :param args: Parsed command-line arguments.
     :type args: argparse.Namespace
-    :param master: Registered master client.
-    :type master: zippy.MasterClient
+    :param master: Registered master client. When omitted, ``zippy.connect()`` is used.
+    :type master: zippy.MasterClient | None
     :returns: Configured factor stream target.
     :rtype: zippy.BusStreamTarget
     """
+    master = master or zippy.master()
     return zippy.BusStreamTarget(
         stream_name=args.output_stream_name,
         master=master,
@@ -277,12 +279,8 @@ def build_pipeline(
     :rtype: zippy.ReactiveStateEngine
     """
     if source is None:
-        if master is None:
-            raise RuntimeError("master is required when source is not provided")
         source = build_source(args, master)
     if target is None:
-        if master is None:
-            raise RuntimeError("master is required when target is not provided")
         target = build_target(args, master)
     sink = zippy.ParquetSink(
         path=args.output_path,
@@ -353,15 +351,27 @@ if __name__ == "__main__":
         "starting remote MID_PRICE_DIFF_200_STD_200 factor pipeline",
     )
     engine.start()
+    loop_state = ExampleRuntimeLoopState.initial(
+        start_monotonic=time.monotonic(),
+        metrics_interval_sec=cli_args.metrics_interval_sec,
+    )
     try:
         while True:
-            zippy.log_info(
-                "openctp_factor_example",
-                "engine_heartbeat",
-                f"engine metrics heartbeat metrics=[{engine.metrics()}]",
-                status=engine.status(),
+            loop_tick = advance_runtime_loop(
+                state=loop_state,
+                now_monotonic=time.monotonic(),
             )
-            time.sleep(cli_args.metrics_interval_sec)
+            loop_state = loop_tick.state
+            if loop_tick.send_heartbeat:
+                master.heartbeat()
+            if loop_tick.send_metrics:
+                zippy.log_info(
+                    "openctp_factor_example",
+                    "engine_heartbeat",
+                    f"engine metrics heartbeat metrics=[{engine.metrics()}]",
+                    status=engine.status(),
+                )
+            time.sleep(loop_tick.sleep_sec)
     except KeyboardInterrupt:
         zippy.log_info(
             "openctp_factor_example",

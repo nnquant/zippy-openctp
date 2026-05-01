@@ -4,20 +4,21 @@ use std::sync::Mutex;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use arrow::array::{ArrayRef, Float64Array, Int64Array, StringArray, TimestampNanosecondArray};
-use arrow::record_batch::RecordBatch;
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use tracing::{debug, error, info, warn};
 use zippy_core::{
-    Result as CoreResult, SchemaRef, Source, SourceEvent, SourceHandle, SourceMode, SourceSink,
-    StreamHello, ZippyError,
+    Result as CoreResult, SchemaRef, SegmentTableView, Source, SourceEvent, SourceHandle,
+    SourceMode, SourceSink, StreamHello, ZippyError,
 };
+use zippy_segment_store::{ActiveSegmentReader, ZippySegmentStoreError};
 
 use crate::driver_ctp::Ctp2rsMdDriver;
 use crate::metrics::OpenCtpSourceMetrics;
 use crate::normalize::{normalize_tick, NormalizeError, NormalizedTickRow, RawTickSnapshot};
 use crate::schema::tick_data_schema;
 use crate::segment_ingress::{OpenCtpSegmentDebugMetrics, OpenCtpSegmentIngress};
+
+const MAX_TICKS_PER_EMIT: usize = 32768;
 
 fn openctp_debug_enabled() -> bool {
     match std::env::var("OPENCTP_DEBUG") {
@@ -50,9 +51,6 @@ pub struct OpenCtpMarketDataSourceConfig {
     pub flow_path: String,
     pub reconnect: bool,
     pub login_timeout_sec: u64,
-    pub rows_per_batch: usize,
-    pub flush_interval_ms: u64,
-    pub segment_ingress_enabled: bool,
 }
 
 impl Debug for OpenCtpMarketDataSourceConfig {
@@ -66,9 +64,6 @@ impl Debug for OpenCtpMarketDataSourceConfig {
             .field("flow_path", &self.flow_path)
             .field("reconnect", &self.reconnect)
             .field("login_timeout_sec", &self.login_timeout_sec)
-            .field("rows_per_batch", &self.rows_per_batch)
-            .field("flush_interval_ms", &self.flush_interval_ms)
-            .field("segment_ingress_enabled", &self.segment_ingress_enabled)
             .finish()
     }
 }
@@ -104,9 +99,6 @@ impl OpenCtpMarketDataSourceConfig {
             flow_path,
             reconnect: true,
             login_timeout_sec: 10,
-            rows_per_batch: 1,
-            flush_interval_ms: 0,
-            segment_ingress_enabled: false,
         }
     }
 }
@@ -167,129 +159,9 @@ impl From<arrow::error::ArrowError> for SourceError {
     }
 }
 
-/// Minimal batching state machine used by Task 4 runtime tests.
-pub struct BufferedTickEmitter {
-    schema: Arc<arrow::datatypes::Schema>,
-    rows_per_batch: usize,
-    flush_interval_ms: u64,
-    buffer: Vec<NormalizedTickRow>,
-    last_flush_at: Option<Instant>,
-}
-
-impl BufferedTickEmitter {
-    pub fn new(
-        schema: Arc<arrow::datatypes::Schema>,
-        rows_per_batch: usize,
-        flush_interval_ms: u64,
-    ) -> Self {
-        Self {
-            schema,
-            rows_per_batch,
-            flush_interval_ms,
-            buffer: Vec::new(),
-            last_flush_at: None,
-        }
-    }
-
-    pub fn push_tick(
-        &mut self,
-        row: NormalizedTickRow,
-    ) -> Result<Option<RecordBatch>, SourceError> {
-        self.push_tick_at(row, Instant::now())
-    }
-
-    pub fn push_tick_at(
-        &mut self,
-        row: NormalizedTickRow,
-        now: Instant,
-    ) -> Result<Option<RecordBatch>, SourceError> {
-        if self.buffer.is_empty() {
-            self.last_flush_at = Some(now);
-        }
-
-        self.buffer.push(row);
-        if self.buffer.len() >= self.rows_per_batch.max(1) {
-            return self.flush_at(now);
-        }
-
-        Ok(None)
-    }
-
-    pub fn flush_if_due(&mut self, now: Instant) -> Result<Option<RecordBatch>, SourceError> {
-        if self.flush_interval_ms == 0 || self.buffer.is_empty() {
-            return Ok(None);
-        }
-
-        let Some(last_flush_at) = self.last_flush_at else {
-            return Ok(None);
-        };
-
-        if now.duration_since(last_flush_at).as_millis() as u64 >= self.flush_interval_ms {
-            return self.flush_at(now);
-        }
-
-        Ok(None)
-    }
-
-    pub fn flush(&mut self) -> Result<Option<RecordBatch>, SourceError> {
-        self.flush_at(Instant::now())
-    }
-
-    fn flush_at(&mut self, now: Instant) -> Result<Option<RecordBatch>, SourceError> {
-        if self.buffer.is_empty() {
-            return Ok(None);
-        }
-
-        let rows = self.buffer.drain(..).collect::<Vec<_>>();
-        let emit_ns = sample_localtime_ns()?;
-        let batch = stamp_batch_source_emit_ns(
-            normalized_rows_to_record_batch(self.schema.clone(), rows)?,
-            emit_ns,
-        )?;
-        self.last_flush_at = Some(now);
-        Ok(Some(batch))
-    }
-}
-
-/// Minimal fake runtime used to drive batching tests without any external dependency.
-pub struct FakeOpenCtpSourceRuntime {
-    emitter: BufferedTickEmitter,
-}
-
-impl FakeOpenCtpSourceRuntime {
-    pub fn new(config: OpenCtpMarketDataSourceConfig) -> Self {
-        Self {
-            emitter: BufferedTickEmitter::new(
-                tick_data_schema(),
-                config.rows_per_batch,
-                config.flush_interval_ms,
-            ),
-        }
-    }
-
-    pub fn push_tick(&mut self, raw: RawTickSnapshot) -> Result<Option<RecordBatch>, SourceError> {
-        let mut row = normalize_tick(&raw)?;
-        row.localtime_ns = sample_localtime_ns()?;
-        self.emitter.push_tick(row)
-    }
-
-    pub fn push_tick_at(
-        &mut self,
-        raw: RawTickSnapshot,
-        now: Instant,
-    ) -> Result<Option<RecordBatch>, SourceError> {
-        let mut row = normalize_tick(&raw)?;
-        row.localtime_ns = sample_localtime_ns()?;
-        self.emitter.push_tick_at(row, now)
-    }
-
-    pub fn flush_if_due(&mut self, now: Instant) -> Result<Option<RecordBatch>, SourceError> {
-        self.emitter.flush_if_due(now)
-    }
-}
-
 pub enum MdDriverEvent {
     Tick(RawTickSnapshot),
+    Ticks(Vec<RawTickSnapshot>),
     SubscriptionOutcome(SubscriptionOutcome),
     ReconnectUpdate(ReconnectUpdate),
     Flush,
@@ -408,6 +280,7 @@ impl ReconnectState {
 }
 
 type MdDriverStopFn = Box<dyn FnMut() -> CoreResult<()> + Send>;
+type SharedMdDriverStopFn = Arc<Mutex<Option<MdDriverStopFn>>>;
 
 pub struct MdDriverHandle {
     join_handle: JoinHandle<CoreResult<()>>,
@@ -498,11 +371,16 @@ impl FakeMdDriverHandle {
     }
 }
 
+pub trait OpenCtpSegmentDescriptorPublisher: Send + Sync + 'static {
+    fn publish(&self, descriptor_envelope: Vec<u8>) -> CoreResult<()>;
+}
+
 pub struct OpenCtpMarketDataSource {
     config: OpenCtpMarketDataSourceConfig,
     schema: SchemaRef,
     metrics: Arc<Mutex<OpenCtpSourceMetrics>>,
     segment_debug_metrics: Arc<Mutex<Option<OpenCtpSegmentDebugMetrics>>>,
+    segment_descriptor_publisher: Option<Arc<dyn OpenCtpSegmentDescriptorPublisher>>,
     status: Arc<Mutex<OpenCtpSourceStatus>>,
     driver: Box<dyn MdDriver>,
 }
@@ -518,6 +396,7 @@ impl OpenCtpMarketDataSource {
             schema: tick_data_schema(),
             metrics: Arc::new(Mutex::new(OpenCtpSourceMetrics::default())),
             segment_debug_metrics: Arc::new(Mutex::new(None)),
+            segment_descriptor_publisher: None,
             status: Arc::new(Mutex::new(OpenCtpSourceStatus::Created)),
             driver,
         }
@@ -541,6 +420,14 @@ impl OpenCtpMarketDataSource {
 
     pub fn segment_debug_metrics_handle(&self) -> Arc<Mutex<Option<OpenCtpSegmentDebugMetrics>>> {
         self.segment_debug_metrics.clone()
+    }
+
+    pub fn with_segment_descriptor_publisher(
+        mut self,
+        publisher: Arc<dyn OpenCtpSegmentDescriptorPublisher>,
+    ) -> Self {
+        self.segment_descriptor_publisher = Some(publisher);
+        self
     }
 
     pub fn status_handle(&self) -> Arc<Mutex<OpenCtpSourceStatus>> {
@@ -567,11 +454,11 @@ impl Source for OpenCtpMarketDataSource {
             schema,
             metrics,
             segment_debug_metrics,
+            segment_descriptor_publisher,
             status,
             driver,
         } = *self;
 
-        validate_segment_ingress_config(&config)?;
         let (tx, rx) = unbounded();
         set_status(&status, OpenCtpSourceStatus::Connecting);
         let driver_handle = match driver.start(tx) {
@@ -582,6 +469,9 @@ impl Source for OpenCtpMarketDataSource {
             }
         };
         let (driver_join_handle, driver_stop_fn) = driver_handle.into_parts();
+        let shared_driver_stop_fn =
+            driver_stop_fn.map(|stop_fn| Arc::new(Mutex::new(Some(stop_fn))));
+        let source_driver_stop_fn = shared_driver_stop_fn.clone();
         let source_metrics = metrics.clone();
         let source_segment_debug_metrics = segment_debug_metrics.clone();
         let source_status = status.clone();
@@ -590,45 +480,61 @@ impl Source for OpenCtpMarketDataSource {
 
         let join_handle = thread::spawn(move || -> CoreResult<()> {
             openctp_debug_log("source thread started");
-            set_status(&source_status, OpenCtpSourceStatus::Running);
-            info!(
-                component = "openctp_source",
-                event = "source_start",
-                front = %source_front,
-                instrument_count = source_instrument_count,
-                message = "market data source thread started"
-            );
-            sink.emit(SourceEvent::Hello(StreamHello::new(
-                "openctp.tick",
-                schema.clone(),
-                1,
-            )?))?;
+            let runtime_result = (|| -> CoreResult<()> {
+                set_status(&source_status, OpenCtpSourceStatus::Running);
+                info!(
+                    component = "openctp_source",
+                    event = "source_start",
+                    front = %source_front,
+                    instrument_count = source_instrument_count,
+                    message = "market data source thread started"
+                );
+                sink.emit(SourceEvent::Hello(StreamHello::new(
+                    "openctp.tick",
+                    schema.clone(),
+                    1,
+                )?))?;
 
-            let mut segment_ingress = if config.segment_ingress_enabled {
-                Some(
+                let mut segment_ingress =
                     OpenCtpSegmentIngress::new_for_source().map_err(|reason| ZippyError::Io {
                         reason: reason.to_string(),
-                    })?,
-                )
-            } else {
-                None
-            };
-            let mut emitter =
-                BufferedTickEmitter::new(schema, config.rows_per_batch, config.flush_interval_ms);
+                    })?;
+                publish_segment_descriptor_if_needed(
+                    &segment_ingress,
+                    &segment_descriptor_publisher,
+                )?;
+                let mut segment_reader = segment_ingress
+                    .active_reader()
+                    .map_err(segment_zippy_error)?;
 
-            let runtime_result = run_driver_event_loop(
-                rx,
-                sink,
-                &mut emitter,
-                &mut segment_ingress,
-                &source_metrics,
-                &source_segment_debug_metrics,
-                &source_status,
-            );
+                run_driver_event_loop(
+                    rx,
+                    DriverEventLoopContext {
+                        sink,
+                        segment_ingress: &mut segment_ingress,
+                        segment_reader: &mut segment_reader,
+                        metrics: &source_metrics,
+                        segment_debug_metrics: &source_segment_debug_metrics,
+                        segment_descriptor_publisher: &segment_descriptor_publisher,
+                        status: &source_status,
+                    },
+                )
+            })();
             openctp_debug_log(&format!(
                 "source thread runtime_result=[{}]",
                 runtime_result.is_ok()
             ));
+            if let Err(error) = &runtime_result {
+                if let Err(stop_error) = request_optional_driver_stop(&source_driver_stop_fn) {
+                    warn!(
+                        component = "openctp_source",
+                        event = "driver_stop_failure",
+                        error = %stop_error,
+                        source_error = %error,
+                        message = "market data source failed before driver stopped cleanly"
+                    );
+                }
+            }
             let driver_result = join_driver_handle(driver_join_handle);
             openctp_debug_log(&format!(
                 "source thread driver_result=[{}]",
@@ -668,120 +574,77 @@ impl Source for OpenCtpMarketDataSource {
             }
         });
 
-        match driver_stop_fn {
-            Some(stop_fn) => Ok(SourceHandle::new_with_stop(join_handle, stop_fn)),
+        match shared_driver_stop_fn {
+            Some(stop_fn) => Ok(SourceHandle::new_with_stop(
+                join_handle,
+                Box::new(move || request_shared_driver_stop(&stop_fn)),
+            )),
             None => Ok(SourceHandle::new(join_handle)),
         }
     }
 }
 
-fn normalized_rows_to_record_batch(
-    schema: Arc<arrow::datatypes::Schema>,
-    rows: Vec<NormalizedTickRow>,
-) -> Result<RecordBatch, SourceError> {
-    let instrument_ids = StringArray::from(
-        rows.iter()
-            .map(|row| row.instrument_id.as_str())
-            .collect::<Vec<_>>(),
-    );
-    let exchange_ids = StringArray::from(
-        rows.iter()
-            .map(|row| row.exchange_id.as_deref())
-            .collect::<Vec<_>>(),
-    );
-    let trading_days = StringArray::from(
-        rows.iter()
-            .map(|row| row.trading_day.as_deref())
-            .collect::<Vec<_>>(),
-    );
-    let action_days = StringArray::from(
-        rows.iter()
-            .map(|row| row.action_day.as_deref())
-            .collect::<Vec<_>>(),
-    );
-    let dts = TimestampNanosecondArray::from(rows.iter().map(|row| row.dt_ns).collect::<Vec<_>>())
-        .with_timezone("Asia/Shanghai");
-    let localtime_nss =
-        Int64Array::from(rows.iter().map(|row| row.localtime_ns).collect::<Vec<_>>());
-    let source_emit_nss = Int64Array::from(
-        rows.iter()
-            .map(|row| row.source_emit_ns)
-            .collect::<Vec<_>>(),
-    );
-    let last_prices = Float64Array::from(rows.iter().map(|row| row.last_price).collect::<Vec<_>>());
-    let volumes = Int64Array::from(rows.iter().map(|row| row.volume).collect::<Vec<_>>());
-    let turnovers = Float64Array::from(rows.iter().map(|row| row.turnover).collect::<Vec<_>>());
-    let open_interests =
-        Float64Array::from(rows.iter().map(|row| row.open_interest).collect::<Vec<_>>());
-    let bid_prices = Float64Array::from(rows.iter().map(|row| row.bid_price_1).collect::<Vec<_>>());
-    let bid_volumes = Int64Array::from(rows.iter().map(|row| row.bid_volume_1).collect::<Vec<_>>());
-    let ask_prices = Float64Array::from(rows.iter().map(|row| row.ask_price_1).collect::<Vec<_>>());
-    let ask_volumes = Int64Array::from(rows.iter().map(|row| row.ask_volume_1).collect::<Vec<_>>());
-
-    let columns: Vec<ArrayRef> = vec![
-        Arc::new(instrument_ids),
-        Arc::new(exchange_ids),
-        Arc::new(trading_days),
-        Arc::new(action_days),
-        Arc::new(dts),
-        Arc::new(localtime_nss),
-        Arc::new(source_emit_nss),
-        Arc::new(last_prices),
-        Arc::new(volumes),
-        Arc::new(turnovers),
-        Arc::new(open_interests),
-        Arc::new(bid_prices),
-        Arc::new(bid_volumes),
-        Arc::new(ask_prices),
-        Arc::new(ask_volumes),
-    ];
-
-    RecordBatch::try_new(schema, columns).map_err(SourceError::from)
-}
-
-fn stamp_batch_source_emit_ns(
-    batch: RecordBatch,
-    emit_ns: i64,
-) -> Result<RecordBatch, SourceError> {
-    let source_emit_index = batch.schema().index_of("source_emit_ns").map_err(|error| {
-        SourceError::Arrow(arrow::error::ArrowError::SchemaError(error.to_string()))
-    })?;
-    let mut columns = batch.columns().to_vec();
-    columns[source_emit_index] = Arc::new(Int64Array::from(vec![emit_ns; batch.num_rows()]));
-    RecordBatch::try_new(batch.schema(), columns).map_err(SourceError::from)
+struct DriverEventLoopContext<'a> {
+    sink: Arc<dyn SourceSink>,
+    segment_ingress: &'a mut OpenCtpSegmentIngress,
+    segment_reader: &'a mut ActiveSegmentReader,
+    metrics: &'a Arc<Mutex<OpenCtpSourceMetrics>>,
+    segment_debug_metrics: &'a Arc<Mutex<Option<OpenCtpSegmentDebugMetrics>>>,
+    segment_descriptor_publisher: &'a Option<Arc<dyn OpenCtpSegmentDescriptorPublisher>>,
+    status: &'a Arc<Mutex<OpenCtpSourceStatus>>,
 }
 
 fn run_driver_event_loop(
     rx: Receiver<MdDriverEvent>,
-    sink: Arc<dyn SourceSink>,
-    emitter: &mut BufferedTickEmitter,
-    segment_ingress: &mut Option<OpenCtpSegmentIngress>,
-    metrics: &Arc<Mutex<OpenCtpSourceMetrics>>,
-    segment_debug_metrics: &Arc<Mutex<Option<OpenCtpSegmentDebugMetrics>>>,
-    status: &Arc<Mutex<OpenCtpSourceStatus>>,
+    context: DriverEventLoopContext<'_>,
 ) -> CoreResult<()> {
-    while let Ok(event) = rx.recv() {
+    let mut pending_event = None;
+    loop {
+        let event = match pending_event.take() {
+            Some(event) => event,
+            None => match rx.recv() {
+                Ok(event) => event,
+                Err(_) => break,
+            },
+        };
         match event {
             MdDriverEvent::Tick(raw) => {
-                metrics.lock().unwrap().ticks_received_total += 1;
-                let mut row =
-                    normalize_tick(&raw).map_err(|error| map_source_error(error.into()))?;
-                row.localtime_ns = sample_localtime_ns().map_err(map_source_error)?;
-                if let Some(batch) = emitter.push_tick(row.clone()).map_err(map_source_error)? {
-                    let segment_row =
-                        segment_row_from_batch(&batch, &row).map_err(map_source_error)?;
-                    record_batch_emission(metrics, &batch);
-                    sink.emit(SourceEvent::Data(batch))?;
-                    if let Some(ingress) = segment_ingress.as_mut() {
-                        ingress
-                            .write_row(&segment_row)
-                            .map_err(|reason| map_source_error(SourceError::Segment(reason)))?;
-                        *segment_debug_metrics.lock().unwrap() =
-                            Some(ingress.debug_metrics().map_err(|reason| {
-                                map_source_error(SourceError::Segment(reason))
-                            })?);
-                    }
-                }
+                let raw_ticks = collect_tick_batch(raw, &rx, &mut pending_event);
+                let tick_count = raw_ticks.len();
+                handle_tick_batch(
+                    raw_ticks,
+                    &context.sink,
+                    context.segment_ingress,
+                    context.segment_reader,
+                    context.metrics,
+                    context.segment_descriptor_publisher,
+                )?;
+
+                record_ticks_received(context.metrics, tick_count);
+                refresh_segment_debug_metrics(
+                    context.segment_ingress,
+                    context.segment_debug_metrics,
+                )?;
+                emit_segment_available(context.segment_reader, &context.sink, context.metrics)?;
+            }
+            MdDriverEvent::Ticks(raw_ticks) => {
+                let raw_ticks = collect_tick_batches(raw_ticks, &rx, &mut pending_event);
+                let tick_count = raw_ticks.len();
+                handle_tick_batch(
+                    raw_ticks,
+                    &context.sink,
+                    context.segment_ingress,
+                    context.segment_reader,
+                    context.metrics,
+                    context.segment_descriptor_publisher,
+                )?;
+
+                record_ticks_received(context.metrics, tick_count);
+                refresh_segment_debug_metrics(
+                    context.segment_ingress,
+                    context.segment_debug_metrics,
+                )?;
+                emit_segment_available(context.segment_reader, &context.sink, context.metrics)?;
             }
             MdDriverEvent::SubscriptionOutcome(outcome) => {
                 openctp_debug_log(&format!(
@@ -806,9 +669,9 @@ fn run_driver_event_loop(
                         message = "market data subscribe completed with failures"
                     );
                 }
-                metrics.lock().unwrap().subscribe_failures_total +=
+                context.metrics.lock().unwrap().subscribe_failures_total +=
                     outcome.subscribe_failures_total;
-                set_status(status, outcome.status);
+                set_status(context.status, outcome.status);
             }
             MdDriverEvent::ReconnectUpdate(update) => {
                 openctp_debug_log(&format!(
@@ -833,8 +696,8 @@ fn run_driver_event_loop(
                     ),
                     _ => {}
                 }
-                metrics.lock().unwrap().reconnects_total = update.reconnects_total;
-                set_status(status, update.status);
+                context.metrics.lock().unwrap().reconnects_total = update.reconnects_total;
+                set_status(context.status, update.status);
             }
             MdDriverEvent::Flush => {
                 openctp_debug_log("source loop Flush");
@@ -843,38 +706,30 @@ fn run_driver_event_loop(
                     event = "flush",
                     message = "market data source flush received"
                 );
-                if let Some(batch) = emitter.flush().map_err(map_source_error)? {
-                    record_batch_emission(metrics, &batch);
-                    sink.emit(SourceEvent::Data(batch))?;
-                }
-                sink.emit(SourceEvent::Flush)?;
+                context.sink.emit(SourceEvent::Flush)?;
             }
             MdDriverEvent::Stop => {
                 openctp_debug_log("source loop Stop");
-                if let Some(batch) = emitter.flush().map_err(map_source_error)? {
-                    record_batch_emission(metrics, &batch);
-                    sink.emit(SourceEvent::Data(batch))?;
-                }
-                set_status(status, OpenCtpSourceStatus::Stopped);
+                set_status(context.status, OpenCtpSourceStatus::Stopped);
                 info!(
                     component = "openctp_source",
                     event = "stop",
                     status = OpenCtpSourceStatus::Stopped.as_str(),
                     message = "market data source stop received"
                 );
-                sink.emit(SourceEvent::Stop)?;
+                context.sink.emit(SourceEvent::Stop)?;
                 return Ok(());
             }
             MdDriverEvent::Error(reason) => {
                 openctp_debug_log(&format!("source loop Error reason=[{reason}]"));
-                set_status(status, OpenCtpSourceStatus::Failed);
+                set_status(context.status, OpenCtpSourceStatus::Failed);
                 error!(
                     component = "openctp_source",
                     event = "source_error",
                     error = %reason,
                     message = "market data source received driver error"
                 );
-                sink.emit(SourceEvent::Error(reason.clone()))?;
+                context.sink.emit(SourceEvent::Error(reason.clone()))?;
                 return Err(ZippyError::Io { reason });
             }
         }
@@ -889,6 +744,137 @@ fn run_driver_event_loop(
     Ok(())
 }
 
+fn collect_tick_batch(
+    raw: RawTickSnapshot,
+    rx: &Receiver<MdDriverEvent>,
+    pending_event: &mut Option<MdDriverEvent>,
+) -> Vec<RawTickSnapshot> {
+    collect_tick_batches(vec![raw], rx, pending_event)
+}
+
+fn collect_tick_batches(
+    mut raw_ticks: Vec<RawTickSnapshot>,
+    rx: &Receiver<MdDriverEvent>,
+    pending_event: &mut Option<MdDriverEvent>,
+) -> Vec<RawTickSnapshot> {
+    if raw_ticks.len() > MAX_TICKS_PER_EMIT {
+        let overflow = raw_ticks.split_off(MAX_TICKS_PER_EMIT);
+        *pending_event = Some(MdDriverEvent::Ticks(overflow));
+        return raw_ticks;
+    }
+
+    while raw_ticks.len() < MAX_TICKS_PER_EMIT {
+        match rx.try_recv() {
+            Ok(MdDriverEvent::Tick(raw)) => raw_ticks.push(raw),
+            Ok(MdDriverEvent::Ticks(mut next_ticks)) => {
+                let remaining = MAX_TICKS_PER_EMIT - raw_ticks.len();
+                if next_ticks.len() <= remaining {
+                    raw_ticks.append(&mut next_ticks);
+                } else {
+                    let overflow = next_ticks.split_off(remaining);
+                    raw_ticks.append(&mut next_ticks);
+                    *pending_event = Some(MdDriverEvent::Ticks(overflow));
+                    break;
+                }
+            }
+            Ok(event) => {
+                *pending_event = Some(event);
+                break;
+            }
+            Err(crossbeam_channel::TryRecvError::Empty) => break,
+            Err(crossbeam_channel::TryRecvError::Disconnected) => break,
+        }
+    }
+
+    raw_ticks
+}
+
+fn handle_tick_batch(
+    raw_ticks: Vec<RawTickSnapshot>,
+    sink: &Arc<dyn SourceSink>,
+    ingress: &mut OpenCtpSegmentIngress,
+    reader: &mut ActiveSegmentReader,
+    metrics: &Arc<Mutex<OpenCtpSourceMetrics>>,
+    segment_descriptor_publisher: &Option<Arc<dyn OpenCtpSegmentDescriptorPublisher>>,
+) -> CoreResult<()> {
+    if raw_ticks.is_empty() {
+        return Ok(());
+    }
+
+    let now_ns = sample_localtime_ns().map_err(map_source_error)?;
+    let mut rows = Vec::with_capacity(raw_ticks.len());
+    for raw in raw_ticks {
+        let mut row = normalize_tick(&raw).map_err(|error| map_source_error(error.into()))?;
+        row.localtime_ns = now_ns;
+        row.source_emit_ns = now_ns;
+        rows.push(row);
+    }
+
+    let descriptor_changed = write_segment_rows(ingress, &rows, segment_descriptor_publisher)?;
+    if descriptor_changed {
+        emit_segment_available(reader, sink, metrics)?;
+        ingress
+            .update_active_reader(reader)
+            .map_err(segment_zippy_error)?;
+    }
+    Ok(())
+}
+
+fn write_segment_rows(
+    ingress: &mut OpenCtpSegmentIngress,
+    rows: &[NormalizedTickRow],
+    segment_descriptor_publisher: &Option<Arc<dyn OpenCtpSegmentDescriptorPublisher>>,
+) -> CoreResult<bool> {
+    let active_identity_before = ingress.active_segment_identity();
+    let descriptor_changed = ingress
+        .write_rows(rows)
+        .map_err(|reason| map_source_error(SourceError::Segment(reason)))?
+        || ingress.active_segment_identity() != active_identity_before;
+    if descriptor_changed {
+        publish_segment_descriptor_if_needed(ingress, segment_descriptor_publisher)?;
+    }
+    Ok(descriptor_changed)
+}
+
+fn refresh_segment_debug_metrics(
+    ingress: &OpenCtpSegmentIngress,
+    segment_debug_metrics: &Arc<Mutex<Option<OpenCtpSegmentDebugMetrics>>>,
+) -> CoreResult<()> {
+    *segment_debug_metrics.lock().unwrap() = Some(
+        ingress
+            .debug_metrics()
+            .map_err(|reason| map_source_error(SourceError::Segment(reason)))?,
+    );
+    Ok(())
+}
+
+fn emit_segment_available(
+    reader: &mut ActiveSegmentReader,
+    sink: &Arc<dyn SourceSink>,
+    metrics: &Arc<Mutex<OpenCtpSourceMetrics>>,
+) -> CoreResult<()> {
+    let Some(span) = reader.read_available().map_err(segment_zippy_error)? else {
+        return Ok(());
+    };
+    let rows = span.row_count();
+    sink.emit(SourceEvent::Data(SegmentTableView::from_row_span(span)))?;
+    record_data_emission(metrics, rows);
+    Ok(())
+}
+
+fn publish_segment_descriptor_if_needed(
+    ingress: &OpenCtpSegmentIngress,
+    publisher: &Option<Arc<dyn OpenCtpSegmentDescriptorPublisher>>,
+) -> CoreResult<()> {
+    let Some(publisher) = publisher else {
+        return Ok(());
+    };
+    let envelope = ingress
+        .active_descriptor_envelope_bytes()
+        .map_err(|reason| map_source_error(SourceError::Segment(reason)))?;
+    publisher.publish(envelope)
+}
+
 fn sample_localtime_ns() -> Result<i64, SourceError> {
     let duration = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -897,9 +883,13 @@ fn sample_localtime_ns() -> Result<i64, SourceError> {
     i64::try_from(duration.as_nanos()).map_err(|error| SourceError::Clock(error.to_string()))
 }
 
-fn record_batch_emission(metrics: &Arc<Mutex<OpenCtpSourceMetrics>>, batch: &RecordBatch) {
+fn record_ticks_received(metrics: &Arc<Mutex<OpenCtpSourceMetrics>>, rows: usize) {
+    metrics.lock().unwrap().ticks_received_total += rows as u64;
+}
+
+fn record_data_emission(metrics: &Arc<Mutex<OpenCtpSourceMetrics>>, rows: usize) {
     let mut metrics = metrics.lock().unwrap();
-    metrics.ticks_emitted_total += batch.num_rows() as u64;
+    metrics.ticks_emitted_total += rows as u64;
     metrics.batches_emitted_total += 1;
 }
 
@@ -909,83 +899,33 @@ fn map_source_error(error: SourceError) -> ZippyError {
     }
 }
 
-fn validate_segment_ingress_config(config: &OpenCtpMarketDataSourceConfig) -> CoreResult<()> {
-    if config.segment_ingress_enabled
-        && (config.rows_per_batch != 1 || config.flush_interval_ms != 0)
-    {
-        return Err(ZippyError::InvalidConfig {
-            reason: "segment ingress requires rows_per_batch=1 and flush_interval_ms=0".to_string(),
-        });
+fn segment_zippy_error(error: ZippySegmentStoreError) -> ZippyError {
+    ZippyError::Io {
+        reason: error.to_string(),
     }
-
-    Ok(())
-}
-
-fn segment_row_from_batch(
-    batch: &RecordBatch,
-    row: &NormalizedTickRow,
-) -> Result<NormalizedTickRow, SourceError> {
-    let mut segment_row = row.clone();
-    segment_row.dt_ns = batch_timestamp_ns_value(batch, "dt")?;
-    segment_row.localtime_ns = batch_i64_value(batch, "localtime_ns")?;
-    segment_row.source_emit_ns = batch_i64_value(batch, "source_emit_ns")?;
-    segment_row.instrument_id = batch_utf8_value(batch, "instrument_id")?;
-    segment_row.last_price = Some(batch_f64_value(batch, "last_price")?);
-    Ok(segment_row)
-}
-
-fn batch_timestamp_ns_value(batch: &RecordBatch, column_name: &str) -> Result<i64, SourceError> {
-    batch
-        .column_by_name(column_name)
-        .and_then(|column| column.as_any().downcast_ref::<TimestampNanosecondArray>())
-        .map(|array| array.value(0))
-        .ok_or_else(|| {
-            SourceError::Arrow(arrow::error::ArrowError::SchemaError(format!(
-                "missing timestamp(ns) column [{column_name}]"
-            )))
-        })
-}
-
-fn batch_i64_value(batch: &RecordBatch, column_name: &str) -> Result<i64, SourceError> {
-    batch
-        .column_by_name(column_name)
-        .and_then(|column| column.as_any().downcast_ref::<Int64Array>())
-        .map(|array| array.value(0))
-        .ok_or_else(|| {
-            SourceError::Arrow(arrow::error::ArrowError::SchemaError(format!(
-                "missing Int64 column [{column_name}]"
-            )))
-        })
-}
-
-fn batch_utf8_value(batch: &RecordBatch, column_name: &str) -> Result<String, SourceError> {
-    batch
-        .column_by_name(column_name)
-        .and_then(|column| column.as_any().downcast_ref::<StringArray>())
-        .map(|array| array.value(0).to_string())
-        .ok_or_else(|| {
-            SourceError::Arrow(arrow::error::ArrowError::SchemaError(format!(
-                "missing Utf8 column [{column_name}]"
-            )))
-        })
-}
-
-fn batch_f64_value(batch: &RecordBatch, column_name: &str) -> Result<f64, SourceError> {
-    batch
-        .column_by_name(column_name)
-        .and_then(|column| column.as_any().downcast_ref::<Float64Array>())
-        .map(|array| array.value(0))
-        .ok_or_else(|| {
-            SourceError::Arrow(arrow::error::ArrowError::SchemaError(format!(
-                "missing Float64 column [{column_name}]"
-            )))
-        })
 }
 
 fn join_driver_handle(join_handle: JoinHandle<CoreResult<()>>) -> CoreResult<()> {
     join_handle.join().map_err(|_| ZippyError::Io {
         reason: "md driver thread panicked".to_string(),
     })?
+}
+
+fn request_optional_driver_stop(stop_fn: &Option<SharedMdDriverStopFn>) -> CoreResult<()> {
+    let Some(stop_fn) = stop_fn else {
+        return Ok(());
+    };
+    request_shared_driver_stop(stop_fn)
+}
+
+fn request_shared_driver_stop(stop_fn: &SharedMdDriverStopFn) -> CoreResult<()> {
+    let mut guard = stop_fn.lock().unwrap();
+    let Some(stop_fn) = guard.as_mut() else {
+        return Ok(());
+    };
+    stop_fn()?;
+    *guard = None;
+    Ok(())
 }
 
 fn set_status(status: &Arc<Mutex<OpenCtpSourceStatus>>, next: OpenCtpSourceStatus) {

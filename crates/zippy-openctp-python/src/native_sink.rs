@@ -39,7 +39,9 @@ impl NativeCapsuleSink {
         let capsule_name = capsule
             .name()?
             .and_then(|value| value.to_str().ok())
-            .ok_or_else(|| PyRuntimeError::new_err("native source sink capsule has no valid name"))?;
+            .ok_or_else(|| {
+                PyRuntimeError::new_err("native source sink capsule has no valid name")
+            })?;
         if capsule_name != NATIVE_SOURCE_SINK_CAPSULE_NAME {
             return Err(PyRuntimeError::new_err(format!(
                 "unexpected native source sink capsule name [{capsule_name}]"
@@ -105,7 +107,7 @@ impl SourceSink for NativeCapsuleSink {
     fn emit(&self, event: SourceEvent) -> zippy_core::Result<()> {
         match event {
             SourceEvent::Hello(hello) => self.emit_hello(hello),
-            SourceEvent::Data(batch) => self.emit_data(batch),
+            SourceEvent::Data(batch) => self.emit_data(batch.to_record_batch()?),
             SourceEvent::Flush => self.emit_flush(),
             SourceEvent::Stop => self.emit_stop(),
             SourceEvent::Error(reason) => self.emit_error(reason),

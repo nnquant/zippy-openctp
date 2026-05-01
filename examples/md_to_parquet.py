@@ -62,18 +62,6 @@ def parse_args() -> argparse.Namespace:
         help=f"Parquet output directory, default [{DEFAULT_OUTPUT_PATH}]",
     )
     parser.add_argument(
-        "--rows-per-batch",
-        type=int,
-        default=1,
-        help="ticks per emitted batch, default [1]",
-    )
-    parser.add_argument(
-        "--flush-interval-ms",
-        type=int,
-        default=0,
-        help="max batch flush interval in milliseconds, default [0]",
-    )
-    parser.add_argument(
         "--log-dir",
         default=DEFAULT_LOG_DIR,
         help=f"log root directory, default [{DEFAULT_LOG_DIR}]",
@@ -116,8 +104,6 @@ def build_source(args: argparse.Namespace) -> zippy_openctp.OpenCtpMarketDataSou
         password=args.password,
         instruments=_parse_instruments(args.instruments),
         flow_path=args.flow_path,
-        rows_per_batch=args.rows_per_batch,
-        flush_interval_ms=args.flush_interval_ms,
     )
 
 

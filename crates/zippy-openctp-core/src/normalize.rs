@@ -73,8 +73,8 @@ impl RawTickSnapshot {
 /// :param localtime_ns: Local receive timestamp in Unix epoch nanoseconds. This is
 ///     populated by the source layer, not by normalization.
 /// :type localtime_ns: i64
-/// :param source_emit_ns: Batch emit timestamp in Unix epoch nanoseconds. This is
-///     populated by the source layer when a batch is about to be emitted.
+/// :param source_emit_ns: Source emit timestamp in Unix epoch nanoseconds. This is
+///     populated by the source layer immediately before segment commit.
 /// :type source_emit_ns: i64
 #[derive(Debug, Clone, PartialEq)]
 pub struct NormalizedTickRow {
