@@ -8,8 +8,9 @@ pub mod source;
 
 pub use driver_ctp::Ctp2rsMdDriver;
 pub use generator::{
-    OpenCtpMarketGeneratorConfig, OpenCtpMarketGeneratorConfigError, OpenCtpMarketGeneratorDriver,
-    OpenCtpMarketGeneratorSource,
+    OpenCtpColumnarGeneratorSource, OpenCtpMarketGeneratorConfig,
+    OpenCtpMarketGeneratorConfigError, OpenCtpMarketGeneratorDriver, OpenCtpMarketGeneratorSource,
+    OpenCtpNormalizedGeneratorDriver, OpenCtpNormalizedGeneratorSource,
 };
 pub use metrics::OpenCtpSourceMetrics;
 pub use normalize::{normalize_tick, NormalizeError, NormalizedTickRow, RawTickSnapshot};

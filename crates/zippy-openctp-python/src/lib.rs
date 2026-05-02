@@ -13,9 +13,11 @@ use pyo3::types::{PyAny, PyBytes, PyDict, PyModule, PyTuple};
 use zippy_core::{Source, SourceEvent, SourceHandle, SourceSink, StreamHello, ZippyError};
 use zippy_openctp_core::schema::{TickSchemaType, TICK_SCHEMA_FIELDS};
 use zippy_openctp_core::{
-    normalize_tick, openctp_segment_schema, OpenCtpMarketDataSource as CoreOpenCtpMarketDataSource,
-    OpenCtpMarketDataSourceConfig, OpenCtpMarketGeneratorConfig,
-    OpenCtpMarketGeneratorSource as CoreOpenCtpMarketGeneratorSource,
+    normalize_tick, openctp_segment_schema,
+    OpenCtpColumnarGeneratorSource as CoreOpenCtpColumnarGeneratorSource,
+    OpenCtpMarketDataSource as CoreOpenCtpMarketDataSource, OpenCtpMarketDataSourceConfig,
+    OpenCtpMarketGeneratorConfig, OpenCtpMarketGeneratorSource as CoreOpenCtpMarketGeneratorSource,
+    OpenCtpNormalizedGeneratorSource as CoreOpenCtpNormalizedGeneratorSource,
     OpenCtpSegmentDescriptorPublisher, OpenCtpSegmentIngress, OpenCtpSourceMetrics,
     OpenCtpSourceStatus, RawTickSnapshot,
 };
@@ -60,6 +62,22 @@ struct OpenCtpMarketDataSource {
 struct OpenCtpMarketGeneratorSource {
     config: OpenCtpMarketGeneratorConfig,
     source: Option<CoreOpenCtpMarketGeneratorSource>,
+    metrics: Arc<Mutex<OpenCtpSourceMetrics>>,
+    status: Arc<Mutex<OpenCtpSourceStatus>>,
+}
+
+#[pyclass]
+struct OpenCtpNormalizedGeneratorSource {
+    config: OpenCtpMarketGeneratorConfig,
+    source: Option<CoreOpenCtpNormalizedGeneratorSource>,
+    metrics: Arc<Mutex<OpenCtpSourceMetrics>>,
+    status: Arc<Mutex<OpenCtpSourceStatus>>,
+}
+
+#[pyclass]
+struct OpenCtpColumnarGeneratorSource {
+    config: OpenCtpMarketGeneratorConfig,
+    source: Option<CoreOpenCtpColumnarGeneratorSource>,
     metrics: Arc<Mutex<OpenCtpSourceMetrics>>,
     status: Arc<Mutex<OpenCtpSourceStatus>>,
 }
@@ -166,8 +184,16 @@ struct PyCallbackSink {
     sink: Py<PyAny>,
 }
 
+struct NoopSourceSink;
+
 struct PySegmentDescriptorPublisher {
     callback: Py<PyAny>,
+}
+
+impl SourceSink for NoopSourceSink {
+    fn emit(&self, _event: SourceEvent) -> zippy_core::Result<()> {
+        Ok(())
+    }
 }
 
 impl SourceSink for PyCallbackSink {
@@ -266,9 +292,61 @@ fn metrics_to_pydict(py: Python<'_>, metrics: &OpenCtpSourceMetrics) -> PyResult
     dict.set_item("ticks_received_total", metrics.ticks_received_total)?;
     dict.set_item("ticks_emitted_total", metrics.ticks_emitted_total)?;
     dict.set_item("batches_emitted_total", metrics.batches_emitted_total)?;
+    dict.set_item("normalize_failures_total", metrics.normalize_failures_total)?;
     dict.set_item("reconnects_total", metrics.reconnects_total)?;
     dict.set_item("login_failures_total", metrics.login_failures_total)?;
     dict.set_item("subscribe_failures_total", metrics.subscribe_failures_total)?;
+    Ok(dict.into_py(py))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_generator_config(
+    instruments: Vec<String>,
+    interval_ms: u64,
+    exchange_id: String,
+    trading_day: Option<String>,
+    action_day: Option<String>,
+    seed: Option<u64>,
+    base_price: f64,
+    price_step: f64,
+    max_ticks: Option<u64>,
+) -> PyResult<OpenCtpMarketGeneratorConfig> {
+    let mut config = OpenCtpMarketGeneratorConfig::new(instruments, interval_ms)
+        .map_err(|error| py_value_error(error.to_string()))?;
+    config.exchange_id = exchange_id;
+    if let Some(trading_day) = trading_day {
+        if action_day.is_none() {
+            config.action_day = trading_day.clone();
+        }
+        config.trading_day = trading_day;
+    }
+    if let Some(action_day) = action_day {
+        config.action_day = action_day;
+    }
+    if let Some(seed) = seed {
+        config.seed = seed;
+    }
+    config
+        .set_price_model(base_price, price_step)
+        .map_err(|error| py_value_error(error.to_string()))?;
+    config.max_ticks = max_ticks;
+    Ok(config)
+}
+
+fn generator_config_to_pydict(
+    py: Python<'_>,
+    config: &OpenCtpMarketGeneratorConfig,
+) -> PyResult<PyObject> {
+    let dict = PyDict::new_bound(py);
+    dict.set_item("instruments", &config.instruments)?;
+    dict.set_item("interval_ms", config.interval_ms)?;
+    dict.set_item("exchange_id", &config.exchange_id)?;
+    dict.set_item("trading_day", &config.trading_day)?;
+    dict.set_item("action_day", &config.action_day)?;
+    dict.set_item("seed", config.seed)?;
+    dict.set_item("base_price", config.base_price)?;
+    dict.set_item("price_step", config.price_step)?;
+    dict.set_item("max_ticks", config.max_ticks)?;
     Ok(dict.into_py(py))
 }
 
@@ -485,6 +563,17 @@ impl OpenCtpMarketDataSource {
             .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
         Py::new(py, OpenCtpRuntimeHandle { handle })
     }
+
+    fn start_noop(&mut self, py: Python<'_>) -> PyResult<Py<OpenCtpRuntimeHandle>> {
+        let source = self
+            .source
+            .take()
+            .ok_or_else(|| PyRuntimeError::new_err("openctp source already started"))?;
+        let handle = Box::new(source)
+            .start(Arc::new(NoopSourceSink))
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+        Py::new(py, OpenCtpRuntimeHandle { handle })
+    }
 }
 
 #[pymethods]
@@ -631,6 +720,287 @@ impl OpenCtpMarketGeneratorSource {
             .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
         Py::new(py, OpenCtpRuntimeHandle { handle })
     }
+
+    fn start_noop(&mut self, py: Python<'_>) -> PyResult<Py<OpenCtpRuntimeHandle>> {
+        let source = self
+            .source
+            .take()
+            .ok_or_else(|| PyRuntimeError::new_err("openctp generator source already started"))?;
+        let handle = Box::new(source)
+            .start(Arc::new(NoopSourceSink))
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+        Py::new(py, OpenCtpRuntimeHandle { handle })
+    }
+}
+
+#[pymethods]
+impl OpenCtpNormalizedGeneratorSource {
+    #[new]
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (
+        instruments,
+        interval_ms,
+        *,
+        exchange_id="CFFEX".to_string(),
+        trading_day=None,
+        action_day=None,
+        seed=None,
+        base_price=4000.0,
+        price_step=0.2,
+        max_ticks=None,
+        segment_descriptor_publisher=None,
+    ))]
+    fn new(
+        py: Python<'_>,
+        instruments: Vec<String>,
+        interval_ms: u64,
+        exchange_id: String,
+        trading_day: Option<String>,
+        action_day: Option<String>,
+        seed: Option<u64>,
+        base_price: f64,
+        price_step: f64,
+        max_ticks: Option<u64>,
+        segment_descriptor_publisher: Option<Py<PyAny>>,
+    ) -> PyResult<Self> {
+        let config = build_generator_config(
+            instruments,
+            interval_ms,
+            exchange_id,
+            trading_day,
+            action_day,
+            seed,
+            base_price,
+            price_step,
+            max_ticks,
+        )?;
+        let mut source = CoreOpenCtpNormalizedGeneratorSource::new(config.clone());
+        if let Some(callback) = segment_descriptor_publisher {
+            if !callback.bind(py).is_callable() {
+                return Err(PyRuntimeError::new_err(
+                    "segment_descriptor_publisher must be callable",
+                ));
+            }
+            source =
+                source.with_segment_descriptor_publisher(Arc::new(PySegmentDescriptorPublisher {
+                    callback,
+                }));
+        }
+        let metrics = source.metrics_handle();
+        let status = source.status_handle();
+
+        Ok(Self {
+            source: Some(source),
+            metrics,
+            status,
+            config,
+        })
+    }
+
+    fn status(&self) -> &str {
+        self.status.lock().unwrap().as_str()
+    }
+
+    fn config(&self, py: Python<'_>) -> PyResult<PyObject> {
+        generator_config_to_pydict(py, &self.config)
+    }
+
+    fn metrics(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let metrics = self.metrics.lock().unwrap().clone();
+        metrics_to_pydict(py, &metrics)
+    }
+
+    fn _zippy_output_schema(&self, py: Python<'_>) -> PyResult<PyObject> {
+        zippy_openctp_core::schema::tick_data_schema()
+            .to_pyarrow(py)
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))
+    }
+
+    fn _zippy_source_mode(&self) -> &str {
+        "pipeline"
+    }
+
+    fn _zippy_source_name(&self) -> &str {
+        "openctp-normalized-generator-source"
+    }
+
+    fn _zippy_source_type(&self) -> &str {
+        "openctp.generator.normalized"
+    }
+
+    fn _zippy_start(
+        &mut self,
+        py: Python<'_>,
+        sink: Py<PyAny>,
+    ) -> PyResult<Py<OpenCtpRuntimeHandle>> {
+        let source = self.source.take().ok_or_else(|| {
+            PyRuntimeError::new_err("openctp normalized generator source already started")
+        })?;
+        let handle = Box::new(source)
+            .start(Arc::new(PyCallbackSink { sink }))
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+        Py::new(py, OpenCtpRuntimeHandle { handle })
+    }
+
+    fn _zippy_start_native(
+        &mut self,
+        py: Python<'_>,
+        sink_capsule: &Bound<'_, PyAny>,
+    ) -> PyResult<Py<OpenCtpRuntimeHandle>> {
+        let source = self.source.take().ok_or_else(|| {
+            PyRuntimeError::new_err("openctp normalized generator source already started")
+        })?;
+        let sink = NativeCapsuleSink::from_capsule(sink_capsule)?;
+        let handle = Box::new(source)
+            .start(Arc::new(sink))
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+        Py::new(py, OpenCtpRuntimeHandle { handle })
+    }
+
+    fn start_noop(&mut self, py: Python<'_>) -> PyResult<Py<OpenCtpRuntimeHandle>> {
+        let source = self.source.take().ok_or_else(|| {
+            PyRuntimeError::new_err("openctp normalized generator source already started")
+        })?;
+        let handle = Box::new(source)
+            .start(Arc::new(NoopSourceSink))
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+        Py::new(py, OpenCtpRuntimeHandle { handle })
+    }
+}
+
+#[pymethods]
+impl OpenCtpColumnarGeneratorSource {
+    #[new]
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (
+        instruments,
+        interval_ms,
+        *,
+        exchange_id="CFFEX".to_string(),
+        trading_day=None,
+        action_day=None,
+        seed=None,
+        base_price=4000.0,
+        price_step=0.2,
+        max_ticks=None,
+        segment_descriptor_publisher=None,
+    ))]
+    fn new(
+        py: Python<'_>,
+        instruments: Vec<String>,
+        interval_ms: u64,
+        exchange_id: String,
+        trading_day: Option<String>,
+        action_day: Option<String>,
+        seed: Option<u64>,
+        base_price: f64,
+        price_step: f64,
+        max_ticks: Option<u64>,
+        segment_descriptor_publisher: Option<Py<PyAny>>,
+    ) -> PyResult<Self> {
+        let config = build_generator_config(
+            instruments,
+            interval_ms,
+            exchange_id,
+            trading_day,
+            action_day,
+            seed,
+            base_price,
+            price_step,
+            max_ticks,
+        )?;
+        let mut source = CoreOpenCtpColumnarGeneratorSource::new(config.clone());
+        if let Some(callback) = segment_descriptor_publisher {
+            if !callback.bind(py).is_callable() {
+                return Err(PyRuntimeError::new_err(
+                    "segment_descriptor_publisher must be callable",
+                ));
+            }
+            source =
+                source.with_segment_descriptor_publisher(Arc::new(PySegmentDescriptorPublisher {
+                    callback,
+                }));
+        }
+        let metrics = source.metrics_handle();
+        let status = source.status_handle();
+
+        Ok(Self {
+            source: Some(source),
+            metrics,
+            status,
+            config,
+        })
+    }
+
+    fn status(&self) -> &str {
+        self.status.lock().unwrap().as_str()
+    }
+
+    fn config(&self, py: Python<'_>) -> PyResult<PyObject> {
+        generator_config_to_pydict(py, &self.config)
+    }
+
+    fn metrics(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let metrics = self.metrics.lock().unwrap().clone();
+        metrics_to_pydict(py, &metrics)
+    }
+
+    fn _zippy_output_schema(&self, py: Python<'_>) -> PyResult<PyObject> {
+        zippy_openctp_core::schema::tick_data_schema()
+            .to_pyarrow(py)
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))
+    }
+
+    fn _zippy_source_mode(&self) -> &str {
+        "pipeline"
+    }
+
+    fn _zippy_source_name(&self) -> &str {
+        "openctp-columnar-generator-source"
+    }
+
+    fn _zippy_source_type(&self) -> &str {
+        "openctp.generator.columnar"
+    }
+
+    fn _zippy_start(
+        &mut self,
+        py: Python<'_>,
+        sink: Py<PyAny>,
+    ) -> PyResult<Py<OpenCtpRuntimeHandle>> {
+        let source = self.source.take().ok_or_else(|| {
+            PyRuntimeError::new_err("openctp columnar generator source already started")
+        })?;
+        let handle = Box::new(source)
+            .start(Arc::new(PyCallbackSink { sink }))
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+        Py::new(py, OpenCtpRuntimeHandle { handle })
+    }
+
+    fn _zippy_start_native(
+        &mut self,
+        py: Python<'_>,
+        sink_capsule: &Bound<'_, PyAny>,
+    ) -> PyResult<Py<OpenCtpRuntimeHandle>> {
+        let source = self.source.take().ok_or_else(|| {
+            PyRuntimeError::new_err("openctp columnar generator source already started")
+        })?;
+        let sink = NativeCapsuleSink::from_capsule(sink_capsule)?;
+        let handle = Box::new(source)
+            .start(Arc::new(sink))
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+        Py::new(py, OpenCtpRuntimeHandle { handle })
+    }
+
+    fn start_noop(&mut self, py: Python<'_>) -> PyResult<Py<OpenCtpRuntimeHandle>> {
+        let source = self.source.take().ok_or_else(|| {
+            PyRuntimeError::new_err("openctp columnar generator source already started")
+        })?;
+        let handle = Box::new(source)
+            .start(Arc::new(NoopSourceSink))
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+        Py::new(py, OpenCtpRuntimeHandle { handle })
+    }
 }
 
 #[pymodule]
@@ -639,6 +1009,8 @@ fn _internal(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(runtime_handle_releases_gil, module)?)?;
     module.add_class::<OpenCtpMarketDataSource>()?;
     module.add_class::<OpenCtpMarketGeneratorSource>()?;
+    module.add_class::<OpenCtpNormalizedGeneratorSource>()?;
+    module.add_class::<OpenCtpColumnarGeneratorSource>()?;
     module.add_class::<OpenCtpSegmentReader>()?;
     module.add_class::<PyOpenCtpSegmentTestWriter>()?;
     module.add_class::<OpenCtpRuntimeHandle>()?;

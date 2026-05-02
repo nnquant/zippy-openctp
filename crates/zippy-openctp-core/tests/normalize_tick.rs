@@ -37,7 +37,7 @@ fn normalize_tick_maps_raw_values_into_schema_row() {
 }
 
 #[test]
-fn normalize_tick_rejects_missing_action_day_after_trimming() {
+fn normalize_tick_falls_back_to_trading_day_when_action_day_is_missing() {
     let raw = RawTickSnapshot {
         instrument_id: "IF2506".to_string(),
         exchange_id: "CFFEX".to_string(),
@@ -55,7 +55,55 @@ fn normalize_tick_rejects_missing_action_day_after_trimming() {
         ask_volume_1: 8,
     };
 
-    let error = normalize_tick(&raw).expect_err("blank action_day must fail");
+    let row = normalize_tick(&raw).expect("trading_day should provide timestamp date");
+    assert_eq!(row.action_day.as_deref(), Some("20260408"));
+    assert_eq!(row.dt_ns, 1_775_611_800_500_000_000);
+}
+
+#[test]
+fn normalize_tick_falls_back_to_trading_day_when_action_day_is_invalid() {
+    let raw = RawTickSnapshot {
+        instrument_id: "IF2506".to_string(),
+        exchange_id: "CFFEX".to_string(),
+        trading_day: "20260408".to_string(),
+        action_day: "00000000".to_string(),
+        update_time: "09:30:00".to_string(),
+        update_millisec: 500,
+        last_price: 3912.4,
+        volume: 1234,
+        turnover: 987654.0,
+        open_interest: 56789.0,
+        bid_price_1: 3912.2,
+        bid_volume_1: 10,
+        ask_price_1: 3912.6,
+        ask_volume_1: 8,
+    };
+
+    let row = normalize_tick(&raw).expect("valid trading_day should replace invalid action_day");
+    assert_eq!(row.action_day.as_deref(), Some("20260408"));
+    assert_eq!(row.dt_ns, 1_775_611_800_500_000_000);
+}
+
+#[test]
+fn normalize_tick_rejects_tick_without_any_valid_date() {
+    let raw = RawTickSnapshot {
+        instrument_id: "IF2506".to_string(),
+        exchange_id: "CFFEX".to_string(),
+        trading_day: "   ".to_string(),
+        action_day: "00000000".to_string(),
+        update_time: "09:30:00".to_string(),
+        update_millisec: 500,
+        last_price: 3912.4,
+        volume: 1234,
+        turnover: 987654.0,
+        open_interest: 56789.0,
+        bid_price_1: 3912.2,
+        bid_volume_1: 10,
+        ask_price_1: 3912.6,
+        ask_volume_1: 8,
+    };
+
+    let error = normalize_tick(&raw).expect_err("tick without valid date must fail");
     assert_eq!(error, NormalizeError::InvalidDate);
 }
 

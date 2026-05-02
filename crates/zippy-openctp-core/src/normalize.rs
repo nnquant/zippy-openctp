@@ -126,8 +126,7 @@ impl Error for NormalizeError {}
 /// :returns: Normalized row aligned with the fixed tick schema.
 /// :rtype: Result[NormalizedTickRow, NormalizeError]
 pub fn normalize_tick(raw: &RawTickSnapshot) -> Result<NormalizedTickRow, NormalizeError> {
-    let action_day =
-        normalize_string(raw.action_day.as_str()).ok_or(NormalizeError::InvalidDate)?;
+    let action_day = select_timestamp_day(raw)?;
     let dt_ns = compose_exchange_timestamp_ns(
         action_day.as_str(),
         raw.update_time.as_str(),
@@ -153,6 +152,19 @@ pub fn normalize_tick(raw: &RawTickSnapshot) -> Result<NormalizedTickRow, Normal
     })
 }
 
+fn select_timestamp_day(raw: &RawTickSnapshot) -> Result<String, NormalizeError> {
+    if let Some(action_day) = normalize_string(raw.action_day.as_str()) {
+        if parse_ymd(action_day.as_str()).is_ok() {
+            return Ok(action_day);
+        }
+    }
+
+    let trading_day =
+        normalize_string(raw.trading_day.as_str()).ok_or(NormalizeError::InvalidDate)?;
+    parse_ymd(trading_day.as_str())?;
+    Ok(trading_day)
+}
+
 fn normalize_string(value: &str) -> Option<String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -162,7 +174,7 @@ fn normalize_string(value: &str) -> Option<String> {
     Some(trimmed.to_string())
 }
 
-fn compose_exchange_timestamp_ns(
+pub(crate) fn compose_exchange_timestamp_ns(
     action_day: &str,
     update_time: &str,
     update_millisec: i32,

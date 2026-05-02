@@ -110,7 +110,7 @@ def build_source(args: argparse.Namespace) -> zippy_openctp.OpenCtpMarketDataSou
 def build_pipeline(
     args: argparse.Namespace,
     source: zippy_openctp.OpenCtpMarketDataSource | None = None,
-) -> zippy.StreamTableEngine:
+) -> zippy._internal.StreamTableMaterializer:
     """
     Build a local OpenCTP tick -> stream table -> Parquet archive pipeline.
 
@@ -120,7 +120,7 @@ def build_pipeline(
         inspect config, status, or metrics before starting the engine.
     :type source: zippy_openctp.OpenCtpMarketDataSource | None
     :returns: Configured time-series engine ready to be started by the caller.
-    :rtype: zippy.StreamTableEngine
+    :rtype: zippy._internal.StreamTableMaterializer
     """
     source = source or build_source(args)
     archive = zippy.ParquetSink(
@@ -130,7 +130,7 @@ def build_pipeline(
         flush_interval_ms=1000,
     )
 
-    return zippy.StreamTableEngine(
+    return zippy._internal.StreamTableMaterializer(
         name="openctp_tick_table",
         source=source,
         input_schema=zippy_openctp.schemas.TickDataSchema(),

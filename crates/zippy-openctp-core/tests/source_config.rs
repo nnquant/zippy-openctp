@@ -23,6 +23,7 @@ fn source_metrics_snapshot_defaults_to_zero_counters() {
     assert_eq!(metrics.ticks_received_total, 0);
     assert_eq!(metrics.ticks_emitted_total, 0);
     assert_eq!(metrics.batches_emitted_total, 0);
+    assert_eq!(metrics.normalize_failures_total, 0);
     assert_eq!(metrics.reconnects_total, 0);
     assert_eq!(metrics.login_failures_total, 0);
     assert_eq!(metrics.subscribe_failures_total, 0);

@@ -120,6 +120,7 @@ fn segment_ingress_batch_write_rolls_over_and_keeps_last_row_visible() {
     let descriptor_changed = ingress.write_rows(&rows).unwrap();
 
     assert!(descriptor_changed);
+    assert_eq!(ingress.retired_segment_count_for_test(), 1);
     let snapshot = ingress.active_snapshot().unwrap();
     assert_eq!(snapshot.committed_row_count, 65);
     assert_eq!(snapshot.instrument_id.as_deref(), Some("rb2510"));
@@ -131,6 +132,10 @@ fn segment_ingress_batch_write_rolls_over_and_keeps_last_row_visible() {
     let batch = partition.debug_snapshot_record_batch().unwrap();
     assert_eq!(batch.num_rows(), 1);
     assert_eq!(f64_value_at(&batch, "last_price", 0), 4123.5 + 64.0);
+
+    assert_eq!(ingress.release_retired_segments(), 1);
+    assert_eq!(ingress.release_retired_segments(), 0);
+    assert_eq!(ingress.retired_segment_count_for_test(), 0);
 }
 
 fn normalized_row(

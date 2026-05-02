@@ -50,17 +50,14 @@ source = zippy_openctp.OpenCtpMarketDataSource(
     flow_path=".cache/openctp/md",
 )
 
-table = zippy.StreamTableEngine(
-    name="openctp_ticks",
-    source=source,
-    input_schema=zippy_openctp.schemas.TickDataSchema(),
-    target=zippy.NullPublisher(),
-    sink=zippy.ParquetSink(
-        path="data/openctp_ticks",
-        write_output=True,
-        rows_per_batch=8192,
-        flush_interval_ms=1000,
-    ),
+pipeline = (
+    zippy.Pipeline("openctp_quickstart")
+    .source(source)
+    .stream_table(
+        "openctp_ticks",
+        schema=zippy_openctp.schemas.TickDataSchema(),
+        persist_path="data/openctp_ticks",
+    )
 )
 ```
 
@@ -78,8 +75,8 @@ zippy.setup_log(
 
 `OpenCtpMarketDataSource(...)` 只会构造 source 对象；不会在 import 或构造阶段立刻发起真实连接。
 真实 OpenCTP 登录、订阅与收流会在关联的 engine 执行 `start()` 后发生。
-插件会在 source 内部管理 segment 写入、active descriptor 和 reader attach，`StreamTableEngine`
-仍然直接消费这个 source，不需要用户手写 `SegmentStreamSource` 或 segment writer 生命周期代码。
+插件会在 source 内部管理 segment 写入、active descriptor 和 reader attach，`Pipeline.stream_table()`
+会直接消费这个 source，不需要用户手写 `SegmentStreamSource` 或 segment writer 生命周期代码。
 
 ## Market Generator Source
 
@@ -97,7 +94,7 @@ source = zippy_openctp.OpenCtpMarketGeneratorSource(
 `interval_ms` 表示每隔 `T` ms 生成一轮完整行情；每轮会按配置顺序为所有 instrument 各生成
 一条 tick。因此理论输入速率约为 `len(instruments) * 1000 / interval_ms` ticks/s。generator
 复用真实 OpenCTP source 的 normalize、segment ingress、descriptor publisher 和 zippy source 生命周期，
-下游 `StreamTableEngine`、`TimeSeriesEngine`、`ReactiveStateEngine` 不需要改代码。
+下游 `Pipeline.stream_table()`、`TimeSeriesEngine`、`ReactiveStateEngine` 不需要改代码。
 
 ## Live Source 手工验证
 

@@ -139,16 +139,16 @@ def build_source(
 
 def build_pipeline(
     source: zippy.BusStreamSource,
-) -> zippy.StreamTableEngine:
+) -> zippy._internal.StreamTableMaterializer:
     """
     Build the local stream-table bridge that keeps the source runtime alive.
 
     :param source: Pre-built factor source.
     :type source: zippy.BusStreamSource
     :returns: Configured stream-table engine.
-    :rtype: zippy.StreamTableEngine
+    :rtype: zippy._internal.StreamTableMaterializer
     """
-    return zippy.StreamTableEngine(
+    return zippy._internal.StreamTableMaterializer(
         name="openctp_mid_price_factor_subscriber",
         source=source,
         input_schema=factor_schema(),

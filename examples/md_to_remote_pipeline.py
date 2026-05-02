@@ -310,7 +310,7 @@ def build_pipeline(
     master: zippy.MasterClient | None = None,
     source: zippy_openctp.OpenCtpMarketDataSource | None = None,
     target: zippy.BusStreamTarget | None = None,
-) -> zippy.StreamTableEngine:
+) -> zippy._internal.StreamTableMaterializer:
     """
     Build an OpenCTP tick -> stream table -> master bus pipeline.
 
@@ -326,7 +326,7 @@ def build_pipeline(
         inspect the bound stream before starting the engine.
     :type target: zippy.BusStreamTarget | None
     :returns: Configured stream-table engine ready to be started by the caller.
-    :rtype: zippy.StreamTableEngine
+    :rtype: zippy._internal.StreamTableMaterializer
     """
     source = source or build_source(args, master)
     if target is None:
@@ -340,7 +340,7 @@ def build_pipeline(
         flush_interval_ms=1000,
     )
 
-    return zippy.StreamTableEngine(
+    return zippy._internal.StreamTableMaterializer(
         name="openctp_tick_table_remote",
         source=source,
         input_schema=zippy_openctp.schemas.TickDataSchema(),

@@ -1,11 +1,13 @@
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use arrow::array::{Float64Array, StringArray, TimestampNanosecondArray};
 use arrow::record_batch::RecordBatch;
 use zippy_core::{Result as CoreResult, Source, SourceEvent, SourceSink};
 use zippy_openctp_core::{
-    MdDriver, MdDriverEvent, OpenCtpMarketGeneratorConfig, OpenCtpMarketGeneratorDriver,
-    OpenCtpMarketGeneratorSource, OpenCtpSourceStatus,
+    MdDriver, MdDriverEvent, OpenCtpColumnarGeneratorSource, OpenCtpMarketGeneratorConfig,
+    OpenCtpMarketGeneratorDriver, OpenCtpMarketGeneratorSource, OpenCtpNormalizedGeneratorDriver,
+    OpenCtpNormalizedGeneratorSource, OpenCtpSourceStatus,
 };
 
 #[derive(Default)]
@@ -160,6 +162,106 @@ fn generator_driver_emits_one_raw_tick_batch_per_instrument_round() {
     assert!(matches!(stop, MdDriverEvent::Stop));
 }
 
+#[test]
+fn normalized_generator_driver_emits_normalized_row_batches_without_raw_normalization() {
+    let config = OpenCtpMarketGeneratorConfig::new(
+        vec![
+            "IF2606".to_string(),
+            "IH2606".to_string(),
+            "IC2606".to_string(),
+        ],
+        1,
+    )
+    .unwrap()
+    .with_seed(42)
+    .with_max_ticks(Some(6));
+    let (tx, rx) = crossbeam_channel::unbounded();
+
+    let _handle = Box::new(OpenCtpNormalizedGeneratorDriver::new(config))
+        .start(tx)
+        .unwrap();
+
+    let first = rx.recv().unwrap();
+    let second = rx.recv().unwrap();
+    let stop = rx.recv().unwrap();
+
+    assert_normalized_round_batch(first, &["IF2606", "IH2606", "IC2606"]);
+    assert_normalized_round_batch(second, &["IF2606", "IH2606", "IC2606"]);
+    assert!(matches!(stop, MdDriverEvent::Stop));
+}
+
+#[test]
+fn normalized_generator_interval_controls_event_time_without_wall_clock_pacing() {
+    let config = OpenCtpMarketGeneratorConfig::new(vec!["IF2606".to_string()], 60_000)
+        .unwrap()
+        .with_seed(42)
+        .with_max_ticks(Some(2));
+    let (tx, rx) = crossbeam_channel::unbounded();
+
+    let _handle = Box::new(OpenCtpNormalizedGeneratorDriver::new(config))
+        .start(tx)
+        .unwrap();
+
+    let first = rx.recv_timeout(Duration::from_millis(200)).unwrap();
+    let second = rx.recv_timeout(Duration::from_millis(200)).unwrap();
+    let stop = rx.recv_timeout(Duration::from_millis(200)).unwrap();
+
+    assert_normalized_round_batch(first, &["IF2606"]);
+    assert_normalized_round_batch(second, &["IF2606"]);
+    assert!(matches!(stop, MdDriverEvent::Stop));
+}
+
+#[test]
+fn normalized_generator_source_uses_distinct_source_identity() {
+    let config =
+        OpenCtpMarketGeneratorConfig::new(vec!["IF2606".to_string(), "IH2606".to_string()], 1)
+            .unwrap()
+            .with_seed(42)
+            .with_max_ticks(Some(4));
+    let source = OpenCtpNormalizedGeneratorSource::new(config);
+    let sink = Arc::new(RecordingSink::default());
+
+    let handle = Box::new(source).start(sink.clone()).unwrap();
+    handle.join().unwrap();
+
+    let instruments = sink
+        .batches()
+        .iter()
+        .flat_map(batch_instrument_ids)
+        .collect::<Vec<_>>();
+    assert_eq!(instruments, vec!["IF2606", "IH2606", "IF2606", "IH2606"]);
+}
+
+#[test]
+fn columnar_generator_source_writes_ticks_without_using_market_data_source_path() {
+    let config =
+        OpenCtpMarketGeneratorConfig::new(vec!["IF2606".to_string(), "IH2606".to_string()], 1)
+            .unwrap()
+            .with_seed(42)
+            .with_max_ticks(Some(4));
+    let source = OpenCtpColumnarGeneratorSource::new(config);
+    let status = source.status_handle();
+    let sink = Arc::new(RecordingSink::default());
+
+    let handle = Box::new(source).start(sink.clone()).unwrap();
+    handle.join().unwrap();
+
+    assert_eq!(*status.lock().unwrap(), OpenCtpSourceStatus::Stopped);
+    let events = sink.events();
+    assert_eq!(
+        events.first(),
+        Some(&RecordedEvent::Hello("openctp.tick".to_string()))
+    );
+    assert_eq!(events.last(), Some(&RecordedEvent::Stop));
+
+    let instruments = sink
+        .batches()
+        .iter()
+        .flat_map(batch_instrument_ids)
+        .collect::<Vec<_>>();
+    assert_eq!(instruments, vec!["IF2606", "IH2606", "IF2606", "IH2606"]);
+}
+
 fn batch_instrument_ids(batch: &RecordBatch) -> Vec<String> {
     batch
         .column_by_name("instrument_id")
@@ -209,4 +311,18 @@ fn assert_raw_round_batch(event: MdDriverEvent, expected_instruments: &[&str]) {
     assert!(ticks
         .iter()
         .all(|tick| (0..=999).contains(&tick.update_millisec)));
+}
+
+fn assert_normalized_round_batch(event: MdDriverEvent, expected_instruments: &[&str]) {
+    let MdDriverEvent::Rows(rows) = event else {
+        panic!("expected normalized row batch event");
+    };
+    let instruments = rows
+        .iter()
+        .map(|tick| tick.instrument_id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(instruments, expected_instruments);
+    assert!(rows.iter().all(|tick| tick.dt_ns > 0));
+    assert!(rows.iter().all(|tick| tick.localtime_ns == 0));
+    assert!(rows.iter().all(|tick| tick.source_emit_ns == 0));
 }

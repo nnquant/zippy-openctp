@@ -59,6 +59,7 @@ def test_openctp_source_exposes_config_status_and_metrics():
         "ticks_received_total",
         "ticks_emitted_total",
         "batches_emitted_total",
+        "normalize_failures_total",
         "reconnects_total",
         "login_failures_total",
         "subscribe_failures_total",
@@ -66,6 +67,7 @@ def test_openctp_source_exposes_config_status_and_metrics():
     assert metrics["ticks_received_total"] == 0
     assert metrics["ticks_emitted_total"] == 0
     assert metrics["batches_emitted_total"] == 0
+    assert metrics["normalize_failures_total"] == 0
     assert metrics["reconnects_total"] == 0
     assert metrics["login_failures_total"] == 0
     assert metrics["subscribe_failures_total"] == 0
@@ -94,6 +96,54 @@ def test_openctp_market_generator_source_exposes_config_status_and_metrics():
     assert metrics["batches_emitted_total"] == 0
 
 
+def test_openctp_fast_generator_sources_are_exposed_with_distinct_types():
+    normalized = zippy_openctp.OpenCtpNormalizedGeneratorSource(
+        instruments=["IF2606", "IH2606"],
+        interval_ms=1,
+        max_ticks=4,
+    )
+    columnar = zippy_openctp.OpenCtpColumnarGeneratorSource(
+        instruments=["IF2606", "IH2606"],
+        interval_ms=1,
+        max_ticks=4,
+    )
+
+    assert normalized._zippy_source_name() == "openctp-normalized-generator-source"
+    assert normalized._zippy_source_type() == "openctp.generator.normalized"
+    assert columnar._zippy_source_name() == "openctp-columnar-generator-source"
+    assert columnar._zippy_source_type() == "openctp.generator.columnar"
+
+    normalized_handle = normalized.start_noop()
+    columnar_handle = columnar.start_noop()
+    normalized_handle.join()
+    columnar_handle.join()
+
+    assert normalized.status() == "stopped"
+    assert columnar.status() == "stopped"
+    assert normalized.metrics()["ticks_emitted_total"] == 4
+    assert columnar.metrics()["ticks_emitted_total"] == 4
+
+
+def test_openctp_market_generator_source_start_noop_runs_without_materializer():
+    published = []
+    source = zippy_openctp.OpenCtpMarketGeneratorSource(
+        instruments=["IF2606", "IH2606"],
+        interval_ms=1,
+        max_ticks=4,
+        segment_descriptor_publisher=published.append,
+    )
+
+    handle = source.start_noop()
+    handle.join()
+    metrics = source.metrics()
+
+    assert published
+    assert source.status() == "stopped"
+    assert metrics["ticks_received_total"] == 4
+    assert metrics["ticks_emitted_total"] == 4
+    assert metrics["batches_emitted_total"] >= 1
+
+
 def test_openctp_sources_expose_pipeline_metadata_contract():
     market_source = zippy_openctp.OpenCtpMarketDataSource(
         front="tcp://127.0.0.1:12345",
@@ -111,11 +161,13 @@ def test_openctp_sources_expose_pipeline_metadata_contract():
     assert market_source._zippy_source_type() == "openctp"
     assert market_source._zippy_source_mode() == "pipeline"
     assert market_source._zippy_output_schema() == zippy_openctp.TickDataSchema()
+    assert hasattr(market_source, "start_noop")
 
     assert generator_source._zippy_source_name() == "openctp-market-generator-source"
     assert generator_source._zippy_source_type() == "openctp.generator"
     assert generator_source._zippy_source_mode() == "pipeline"
     assert generator_source._zippy_output_schema() == zippy_openctp.TickDataSchema()
+    assert hasattr(generator_source, "start_noop")
 
 
 def test_openctp_market_generator_source_can_be_used_as_stream_table_source():
@@ -125,7 +177,7 @@ def test_openctp_market_generator_source_can_be_used_as_stream_table_source():
         max_ticks=4,
     )
 
-    engine = zippy.StreamTableEngine(
+    engine = zippy._internal.StreamTableMaterializer(
         name="openctp_generated_ticks",
         source=source,
         input_schema=zippy_openctp.TickDataSchema(),
@@ -483,7 +535,7 @@ def test_openctp_segment_primary_source_can_be_used_as_stream_table_source():
         instruments=["IF2506"],
     )
 
-    engine = zippy.StreamTableEngine(
+    engine = zippy._internal.StreamTableMaterializer(
         name="openctp_tick_table",
         source=source,
         input_schema=zippy_openctp.TickDataSchema(),

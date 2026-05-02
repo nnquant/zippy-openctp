@@ -7,9 +7,9 @@ use arrow::record_batch::RecordBatch;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyAnyMethods, PyCapsule, PyCapsuleMethods};
-use zippy_core::{SourceEvent, SourceSink, StreamHello, ZippyError};
+use zippy_core::{SegmentTableView, SourceEvent, SourceSink, StreamHello, ZippyError};
 
-const NATIVE_SOURCE_SINK_CAPSULE_NAME: &str = "zippy.native_source_sink.v1";
+const NATIVE_SOURCE_SINK_CAPSULE_NAME: &str = "zippy.native_source_sink.v2";
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -17,6 +17,8 @@ pub struct NativeSourceSinkAbi {
     pub ctx: *mut c_void,
     pub emit_hello: unsafe extern "C" fn(*mut c_void, *const c_char, u16) -> c_int,
     pub emit_data_ipc: unsafe extern "C" fn(*mut c_void, *const u8, usize) -> c_int,
+    pub emit_data_segment:
+        unsafe extern "C" fn(*mut c_void, *const u8, usize, u64, u64, u64) -> c_int,
     pub emit_flush: unsafe extern "C" fn(*mut c_void) -> c_int,
     pub emit_stop: unsafe extern "C" fn(*mut c_void) -> c_int,
     pub emit_error: unsafe extern "C" fn(*mut c_void, *const c_char, usize) -> c_int,
@@ -74,7 +76,33 @@ impl NativeCapsuleSink {
         self.call_result("hello", code)
     }
 
-    fn emit_data(&self, batch: RecordBatch) -> zippy_core::Result<()> {
+    fn emit_data(&self, table: SegmentTableView) -> zippy_core::Result<()> {
+        if let Some(row_view) = table.as_segment_row_view() {
+            let span = row_view.row_span();
+            if let Some(descriptor) = span
+                .active_descriptor_envelope_bytes()
+                .map_err(segment_descriptor_error)?
+            {
+                let row_capacity = span
+                    .active_descriptor()
+                    .expect("active descriptor exists when envelope exists")
+                    .layout()
+                    .row_capacity();
+                let code = unsafe {
+                    (self.abi.emit_data_segment)(
+                        self.abi.ctx,
+                        descriptor.as_ptr(),
+                        descriptor.len(),
+                        span.start_row() as u64,
+                        span.end_row() as u64,
+                        row_capacity as u64,
+                    )
+                };
+                return self.call_result("data_segment", code);
+            }
+        }
+
+        let batch = table.to_record_batch()?;
         let bytes = serialize_batch_to_ipc(&batch)?;
         let code = unsafe { (self.abi.emit_data_ipc)(self.abi.ctx, bytes.as_ptr(), bytes.len()) };
         self.call_result("data_ipc", code)
@@ -107,11 +135,17 @@ impl SourceSink for NativeCapsuleSink {
     fn emit(&self, event: SourceEvent) -> zippy_core::Result<()> {
         match event {
             SourceEvent::Hello(hello) => self.emit_hello(hello),
-            SourceEvent::Data(batch) => self.emit_data(batch.to_record_batch()?),
+            SourceEvent::Data(table) => self.emit_data(table),
             SourceEvent::Flush => self.emit_flush(),
             SourceEvent::Stop => self.emit_stop(),
             SourceEvent::Error(reason) => self.emit_error(reason),
         }
+    }
+}
+
+fn segment_descriptor_error(reason: &'static str) -> ZippyError {
+    ZippyError::Io {
+        reason: format!("native source sink failed to encode segment descriptor error=[{reason}]"),
     }
 }
 
