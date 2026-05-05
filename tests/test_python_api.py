@@ -1,5 +1,7 @@
 import importlib
+import os
 from pathlib import Path
+import socket
 import sys
 import time
 from types import SimpleNamespace
@@ -12,10 +14,21 @@ from zippy_openctp import _internal as zippy_openctp_internal
 
 
 def start_master_server(tmp_path: Path) -> tuple[zippy.MasterServer, str]:
-    control_endpoint = str(tmp_path / "zippy-master.sock")
+    control_endpoint = (
+        unused_loopback_uri()
+        if os.name == "nt"
+        else str(tmp_path / "zippy-master.sock")
+    )
     server = zippy.MasterServer(control_endpoint=control_endpoint)
     server.start()
     return server, control_endpoint
+
+
+def unused_loopback_uri() -> str:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        host, port = sock.getsockname()
+    return f"tcp://{host}:{port}"
 
 
 def test_tick_data_schema_is_exposed():
